@@ -3,6 +3,29 @@
 What got added, per landing — dated with a clock and the jj change id. The entry
 format is stated once in AGENTS.md §2.
 
+## 1.2.1 — 2026-11-25
+
+#### App taps wait to be told, and `list_devices` stops listing their own aggregate · 2026-11-25 23:56 · pnwxskyq
+
+- **An app tap no longer asks CoreAudio about every audio process twice a
+  second.** It reads the process list again only when CoreAudio says
+  something changed: an app became or stopped being an audio client, started
+  or stopped playing, or moved to other devices, or a device came or went.
+  An app that starts playing is picked up the moment CoreAudio says so,
+  rather than at the next half-second look. The half-second tick stays for
+  the health check (a stalled tap, a vanished clock device), and reads no
+  process list. Where CoreAudio refuses a listener, that follower reads the
+  list again every 5 s instead.
+- Fixed: a tap following a process's playing state listened to
+  `kAudioProcessPropertyIsRunningOutput`, which CoreAudio never announces
+  (measured on macOS 26.6); the half-second poll hid it. It now listens to
+  `kAudioProcessPropertyIsRunning` and the process's devices, which are.
+- **`list_devices` leaves out the private aggregate device a tap makes**
+  (`simply-audio-capture tap`, a new UID each time a tap is made again), so
+  a consumer no longer sees a device change every time a tap is remade. It
+  is known by its UID prefix, not its name. Nothing else about the list
+  changes.
+
 ## 1.2.0 — 2026-11-12
 
 #### The repo lives at `simply-audio/music-rs`; `audiowatch` on simply-api 0.2.0 · 2026-11-12 21:55 · lnuxzxzt, vsttvmtk
