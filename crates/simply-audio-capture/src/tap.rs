@@ -45,6 +45,16 @@ type OSStatus = i32;
 /// process).
 const AGGREGATE_NAME: &str = "simply-audio-capture tap";
 
+/// What the UID of every private aggregate device a tap makes starts with
+/// (a new UUID follows each time): how [`list_devices`] knows its own.
+const AGGREGATE_UID_PREFIX: &str = "simply-audio-capture-tap-";
+
+/// Whether the device with this UID is one of this crate's own private
+/// aggregates.
+fn is_own(uid: &str) -> bool {
+    uid.starts_with(AGGREGATE_UID_PREFIX)
+}
+
 /// A CoreAudio device: what it has, and whether it's the default output.
 #[derive(Clone, Debug)]
 pub(crate) struct Device {
@@ -56,8 +66,15 @@ pub(crate) struct Device {
     pub is_default_output: bool,
 }
 
-/// Every audio device, inputs and outputs alike.
+/// Every audio device, inputs and outputs alike, except the private
+/// aggregates this crate's own taps make: those come and go with every tap
+/// made again, and are nothing to capture.
 pub(crate) fn list_devices() -> Result<Vec<Device>, Error> {
+    Ok(all_devices()?.into_iter().filter(|d| !is_own(&d.uid)).collect())
+}
+
+/// Every audio device this process sees, its own taps' aggregates included.
+fn all_devices() -> Result<Vec<Device>, Error> {
     let default: AudioObjectID = get(
         kAudioObjectSystemObject as AudioObjectID,
         kAudioHardwarePropertyDefaultOutputDevice,
@@ -527,7 +544,7 @@ unsafe fn create_aggregate(clock: &NSString, taps: &[&NSString]) -> Result<Audio
             })
             .collect();
         let agg_uid =
-            NSString::from_str(&format!("simply-audio-capture-tap-{}", NSUUID::new().UUIDString()));
+            NSString::from_str(&format!("{AGGREGATE_UID_PREFIX}{}", NSUUID::new().UUIDString()));
         let agg_name = NSString::from_str(AGGREGATE_NAME);
         let subs = NSArray::from_slice(&[&*sub_device]);
         let taps = NSArray::from_retained_slice(&sub_taps);
@@ -783,10 +800,17 @@ impl Backend for Hal {
     }
 }
 
-/// How often a follower looks even when the HAL said nothing (it does say
-/// when a process connects or goes; this is the backstop, and the cadence
-/// of the health check).
-const POLL: Duration = Duration::from_millis(500);
+/// How often a follower looks even when the HAL said nothing: the cadence
+/// of its health check and its timers (a stall, a retry, a channel held).
+/// Such a look reads no process list: an app follower reads it again only
+/// when a listener says it changed ([`Listened`]).
+const TICK: Duration = Duration::from_millis(500);
+
+/// How often an app follower reads the process list again although no
+/// listener spoke, while one it relies on could not be registered (on the
+/// system object's process or device list, or on a process's playing or
+/// devices): the backstop for what that listener would have said.
+const FALLBACK: Duration = Duration::from_secs(5);
 
 unsafe extern "C-unwind" fn on_change(
     _object: AudioObjectID,
@@ -809,23 +833,24 @@ fn client_of(wake: &Arc<Wake>) -> *const Wake {
 }
 
 /// Add or remove [`on_change`] for `client` on `object`'s `selector`.
+/// False: the HAL refused (a process that is already gone refuses both:
+/// nothing to do on removal).
 fn listener(
     add: bool,
     object: AudioObjectID,
     (selector, scope): (AudioObjectPropertySelector, AudioObjectPropertyScope),
     client: *const Wake,
-) {
+) -> bool {
     let addr = address(selector, scope);
     unsafe {
         let f =
             if add { AudioObjectAddPropertyListener } else { AudioObjectRemovePropertyListener };
-        // A process that is already gone refuses the removal: nothing to do.
-        f(object, NonNull::from(&addr), Some(on_change), client as *mut c_void);
+        f(object, NonNull::from(&addr), Some(on_change), client as *mut c_void) == 0
     }
 }
 
 /// A thread that ticks a follower: once at the start, then whenever one of
-/// its system-object HAL properties changes (or [`POLL`] passes), until it
+/// its system-object HAL properties changes (or [`TICK`] passes), until it
 /// is dropped.
 struct Watcher {
     wake: Arc<Wake>,
@@ -851,13 +876,18 @@ impl Watcher {
     where
         T: FnMut(Instant) -> Result<(), Error> + Send + 'static,
     {
-        let thread = watch::spawn(name, Arc::clone(&wake), tick)?;
+        // Listening before the first look, so nothing changes unannounced
+        // between the two.
         let client = client_of(&wake);
+        let system = kAudioObjectSystemObject as AudioObjectID;
         for &selector in selectors {
-            let at = (selector, kAudioObjectPropertyScopeGlobal);
-            listener(true, kAudioObjectSystemObject as AudioObjectID, at, client);
+            if !listener(true, system, (selector, kAudioObjectPropertyScopeGlobal), client) {
+                wake.set_unheard();
+            }
         }
-        Ok(Watcher { wake, client, selectors, thread: Some(thread) })
+        let mut w = Watcher { wake, client, selectors, thread: None };
+        w.thread = Some(watch::spawn(name, Arc::clone(&w.wake), tick)?);
+        Ok(w)
     }
 }
 
@@ -886,9 +916,12 @@ unsafe impl Send for ProcessListen {}
 impl ProcessListen {
     fn at(prop: Prop) -> (AudioObjectPropertySelector, AudioObjectPropertyScope) {
         match prop {
-            Prop::Playing => {
-                (kAudioProcessPropertyIsRunningOutput, kAudioObjectPropertyScopeGlobal)
-            }
+            // Its IO starting or stopping. `IsRunningOutput` is the value
+            // read, but a change of it is never announced (measured on
+            // macOS 26.6 by the hand check `the_hal_announces_…`), while
+            // one of `IsRunning` is. A process whose input keeps it running
+            // as its output stops is announced by [`Prop::Devices`].
+            Prop::Playing => (kAudioProcessPropertyIsRunning, kAudioObjectPropertyScopeGlobal),
             // In any scope (output is the one read).
             Prop::Devices => (kAudioProcessPropertyDevices, kAudioObjectPropertyScopeWildcard),
         }
@@ -896,8 +929,8 @@ impl ProcessListen {
 }
 
 impl Listen for ProcessListen {
-    fn add(&mut self, object: u32, prop: Prop) {
-        listener(true, object, ProcessListen::at(prop), self.client);
+    fn add(&mut self, object: u32, prop: Prop) -> bool {
+        listener(true, object, ProcessListen::at(prop), self.client)
     }
     fn remove(&mut self, object: u32, prop: Prop) {
         listener(false, object, ProcessListen::at(prop), self.client);
@@ -905,8 +938,8 @@ impl Listen for ProcessListen {
 }
 
 /// What pokes an app follower: a process came or went, a device list
-/// changed. (And a process started or stopped playing or, for a tap that
-/// reads them, its devices changed: [`ProcessListen`].)
+/// changed. (And a process started or stopped playing, or its devices
+/// changed: [`ProcessListen`].)
 const APPS_WATCHED: [AudioObjectPropertySelector; 2] =
     [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
 
@@ -919,7 +952,8 @@ fn app_backend(
     wake: &Arc<Wake>,
 ) -> Listened<Hal, ProcessListen> {
     let hal = Hal { rate, channels, cache: HashMap::new(), devices: tap.needs_devices() };
-    Listened::new(hal, tap, ProcessListen { client: client_of(wake) })
+    let listen = ProcessListen { client: client_of(wake) };
+    Listened::new(hal, listen, Arc::clone(wake), FALLBACK)
 }
 
 /// A running app follower: its thread owns the [`Follow`] and the tap.
@@ -939,20 +973,20 @@ impl Following {
         channels: usize,
         sink: Sink,
     ) -> Result<Following, Error> {
-        Following::start_polling(tap, rate, channels, sink, POLL)
+        Following::start_ticking(tap, rate, channels, sink, TICK)
     }
 
-    /// [`start`](Following::start), looking every `poll` when nothing woke
+    /// [`start`](Following::start), looking every `tick` when nothing woke
     /// it (a hand check makes it long, to see the listeners at work).
-    fn start_polling(
+    fn start_ticking(
         tap: AppTap,
         rate: u32,
         channels: usize,
         sink: Sink,
-        poll: Duration,
+        tick: Duration,
     ) -> Result<Following, Error> {
         let status = Arc::new(Mutex::new((AppStatus::Failed { error: "starting".into() }, None)));
-        let wake = Arc::new(Wake::new(poll));
+        let wake = Arc::new(Wake::new(tick));
         let backend = app_backend(&tap, rate, channels, &wake);
         let mut follow = Follow::new(backend, tap, std::process::id() as i32, sink);
         let shared = Arc::clone(&status);
@@ -994,7 +1028,7 @@ impl Channels {
         sinks: S,
     ) -> Result<Channels, Error> {
         let status = Arc::new(Mutex::new(ChannelsStatus::default()));
-        let wake = Arc::new(Wake::new(POLL));
+        let wake = Arc::new(Wake::new(TICK));
         let backend = app_backend(&tap, rate, channels, &wake);
         let mut split = Split::new(backend, tap, std::process::id() as i32, sinks);
         let shared = Arc::clone(&status);
@@ -1072,7 +1106,7 @@ impl DefaultTap {
         let now = Arc::new(Mutex::new(Now::default()));
         let mut follow = FollowDefault::new(Defaults { rate, channels }, sink);
         let shared = Arc::clone(&now);
-        let wake = Arc::new(Wake::new(POLL));
+        let wake = Arc::new(Wake::new(TICK));
         let watcher =
             Watcher::start("audio default output tap", wake, &DEFAULT_WATCHED, move |t| {
                 let r = follow.tick(t).map(|_| ());
@@ -1230,22 +1264,142 @@ mod tests {
     /// Follows a real app tap of everything except this process, then
     /// stops it: the private aggregate must be gone. Ignored for the same
     /// reason as the next one.
-    /// The two real-tap tests count aggregates by name, so they must not
-    /// overlap: cargo runs tests in parallel by default.
+    /// The real-tap tests count this process's own aggregates, so they
+    /// must not overlap: cargo runs tests in parallel by default.
     static REAL_TAP: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn only_the_taps_own_aggregate_uids_are_its_own() {
+        let uid = format!("{AGGREGATE_UID_PREFIX}{}", NSUUID::new().UUIDString());
+        assert!(is_own(&uid));
+        assert!(!is_own("BuiltInSpeakerDevice"));
+        assert!(!is_own("com.simply.audio.tussen.in.1"));
+        assert!(!is_own(AGGREGATE_NAME), "the display name is not the UID");
+    }
+
+    /// The hand check that the HAL announces what an app follower no longer
+    /// polls for: another process becoming an audio client (the process
+    /// object list), and starting and stopping its output (its playing
+    /// property). A child ([`silent_client`]) plays silence on the default
+    /// output; no tap is made and no permission needed:
+    /// `cargo test -p simply-audio-capture --lib tap::tests::the_hal_announces -- --ignored --nocapture`.
+    ///
+    /// (A process is not told about its own process object: its playing
+    /// property changes, unannounced, measured on macOS 26. Hence a child.)
+    #[test]
+    #[ignore = "plays silence on the default output"]
+    fn the_hal_announces_a_client_appearing_and_starting_and_stopping_output() {
+        use std::io::Write;
+        let wake = Arc::new(Wake::new(Duration::from_secs(600)));
+        let client = client_of(&wake);
+        let system = kAudioObjectSystemObject as AudioObjectID;
+        let list = (kAudioHardwarePropertyProcessObjectList, kAudioObjectPropertyScopeGlobal);
+        assert!(listener(true, system, list, client), "no listener on the process list");
+        let announced = |wake: &Wake, what: &str, since: u64| {
+            let t = Instant::now();
+            while wake.pokes() == since {
+                assert!(t.elapsed() < Duration::from_secs(3), "the HAL did not announce {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            eprintln!("{what}: announced after {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
+        };
+        let at = wake.pokes();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tap::tests::silent_client", "--ignored", "--nocapture"])
+            .env("SILENT_CLIENT", "1")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let t = Instant::now();
+        let them = loop {
+            if let Some(o) = translate_pid(child.id() as i32) {
+                break o;
+            }
+            assert!(t.elapsed() < Duration::from_secs(10), "the child never became a client");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        announced(&wake, "the child becoming a client", at);
+        // Each property on a wake of its own, so each is seen to announce.
+        let props: Vec<(Prop, Arc<Wake>, *const Wake)> = [Prop::Playing, Prop::Devices]
+            .into_iter()
+            .map(|prop| {
+                let w = Arc::new(Wake::new(Duration::from_secs(600)));
+                let c = client_of(&w);
+                assert!(listener(true, them, ProcessListen::at(prop), c), "{prop:?} refused");
+                (prop, w, c)
+            })
+            .collect();
+        let mut say = |line: &str| {
+            let stdin = child.stdin.as_mut().unwrap();
+            stdin.write_all(format!("{line}\n").as_bytes()).unwrap();
+            stdin.flush().unwrap();
+        };
+        let output = || {
+            get::<u32>(them, kAudioProcessPropertyIsRunningOutput, kAudioObjectPropertyScopeGlobal)
+                .unwrap()
+        };
+        for (line, what, value) in [("play", "starting", 1), ("pause", "stopping", 0)] {
+            std::thread::sleep(Duration::from_millis(300));
+            let at: Vec<u64> = props.iter().map(|(_, w, _)| w.pokes()).collect();
+            say(line);
+            for ((prop, w, _), at) in props.iter().zip(at) {
+                announced(w, &format!("its output {what}, by {prop:?}"), at);
+            }
+            assert_eq!(output(), value);
+        }
+        for (prop, _, c) in &props {
+            listener(false, them, ProcessListen::at(*prop), *c);
+        }
+        drop(child.stdin.take()); // EOF: it ends
+        let at = wake.pokes();
+        let _ = child.wait();
+        announced(&wake, "the child going", at);
+        listener(false, system, list, client);
+    }
+
+    /// Not a test: the child the announcement check spawns. An audio client
+    /// of the default output that plays silence on `play` and stops on
+    /// `pause`, until its stdin closes. Does nothing unless `SILENT_CLIENT`
+    /// is set.
+    #[test]
+    #[ignore = "not a test: the child process the announcement check spawns"]
+    fn silent_client() {
+        use cpal::traits::StreamTrait;
+        use std::io::BufRead;
+        if std::env::var("SILENT_CLIENT").is_err() {
+            return;
+        }
+        let stream = silence();
+        for line in std::io::stdin().lock().lines() {
+            match line.unwrap().as_str() {
+                "play" => stream.play().unwrap(),
+                "pause" => stream.pause().unwrap(),
+                _ => {}
+            }
+        }
+    }
+
+    /// This process's own private aggregates: listed to it by the HAL, left
+    /// out by [`list_devices`].
+    fn ours() -> Vec<AudioObjectID> {
+        let all = all_devices().unwrap();
+        let listed = list_devices().unwrap();
+        assert!(listed.iter().all(|d| !is_own(&d.uid)), "list_devices lists our own aggregate");
+        all.iter().filter(|d| is_own(&d.uid)).map(|d| d.id).collect()
+    }
 
     #[test]
     #[ignore = "creates a real CoreAudio app tap"]
     fn an_app_tap_leaves_no_aggregate_device_behind() {
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         let tap = AppTap::all_except([crate::App::This]);
         let f = Following::start(tap, 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
         eprintln!("{}", f.status());
         assert!(f.status().is_tapping());
-        assert_eq!(ours(), 1);
+        assert_eq!(ours().len(), 1);
         drop(f);
-        assert_eq!(ours(), 0);
+        assert_eq!(ours().len(), 0);
     }
 
     /// An app tap of this test process while it is an audio client that
@@ -1257,14 +1411,6 @@ mod tests {
     #[ignore = "creates a real CoreAudio app tap"]
     fn a_paused_app_s_tap_is_kept_not_re_made() {
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = || -> Vec<AudioObjectID> {
-            list_devices()
-                .unwrap()
-                .iter()
-                .filter(|o| o.name == AGGREGATE_NAME)
-                .map(|o| o.id)
-                .collect()
-        };
         let stream = silence(); // a client, never started
         let tap = AppTap::only([crate::App::This]);
         let f = Following::start(tap, 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
@@ -1272,7 +1418,7 @@ mod tests {
         assert!(f.status().is_tapping());
         let first = ours();
         assert_eq!(first.len(), 1);
-        std::thread::sleep(STALL * 2 + POLL * 2);
+        std::thread::sleep(STALL * 2 + TICK * 2);
         assert!(f.status().is_tapping(), "{}", f.status());
         assert_eq!(ours(), first, "the paused app's tap was re-made");
         drop(f);
@@ -1289,7 +1435,6 @@ mod tests {
     fn an_app_channel_starts_delivers_and_leaves_no_aggregate_behind() {
         use crate::channels::{AppSinks, ChannelState};
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         let stream = silence();
         cpal::traits::StreamTrait::play(&stream).unwrap();
 
@@ -1317,11 +1462,11 @@ mod tests {
         eprintln!("{status:?}");
         assert_eq!(status.channels.len(), 1);
         assert!(matches!(status.channels[0].state, ChannelState::Tapping { .. }));
-        assert_eq!(ours(), 1);
+        assert_eq!(ours().len(), 1);
         assert!(heard.1.load(Ordering::Relaxed) > 0, "the channel's sink got no frames");
         drop(c);
         assert_eq!(*heard.0.lock().unwrap(), [format!("+{me}"), format!("-{me}")]);
-        assert_eq!(ours(), 0);
+        assert_eq!(ours().len(), 0);
         drop(stream);
     }
 
@@ -1365,7 +1510,7 @@ mod tests {
         let Some(other) = outputs
             .iter()
             .find(|d| d.name.contains("BlackHole") || d.uid.starts_with("com.simply.audio.tussen."))
-            .or(outputs.iter().find(|d| d.name != AGGREGATE_NAME))
+            .or(outputs.first())
             .cloned()
         else {
             eprintln!("skipped: no second output device");
@@ -1430,19 +1575,11 @@ mod tests {
         assert!(whole.0 > quiet / 2.0 && whole.1 > loud / 2.0, "{whole:?}");
 
         // 2. The follower, woken by the child's devices changing.
-        let ours = || -> Vec<AudioObjectID> {
-            list_devices()
-                .unwrap()
-                .iter()
-                .filter(|d| d.name == AGGREGATE_NAME)
-                .map(|d| d.id)
-                .collect()
-        };
         let mut child = Player::start(&default.name, &other.name);
         std::thread::sleep(Duration::from_millis(500));
         let heard = Heard::default();
         let tap = AppTap::all_except([crate::App::PlayingInto(other.uid.clone())]);
-        let f = Following::start_polling(tap, 48_000, 2, into(&heard), Duration::from_secs(60))
+        let f = Following::start_ticking(tap, 48_000, 2, into(&heard), Duration::from_secs(60))
             .unwrap();
         assert!(f.status().is_tapping(), "{}", f.status());
         let first = ours();
@@ -1583,7 +1720,6 @@ mod tests {
     #[ignore = "a measurement on real CoreAudio taps, not an assertion"]
     fn measure_tap_costs() {
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         let perm = permission();
         eprintln!("permission: {perm:?}");
         if perm == Permission::Unknown {
@@ -1654,7 +1790,7 @@ mod tests {
                 ms(t1.elapsed())
             );
         }
-        assert_eq!(ours(), 0);
+        assert_eq!(ours().len(), 0);
 
         // One aggregate, taps added and removed while it runs.
         let other = procs.iter().find(|p| p.object != me).expect("coreaudiod has other clients");
@@ -1737,7 +1873,7 @@ mod tests {
             }
         }
         drop(stream);
-        assert_eq!(ours(), 0);
+        assert_eq!(ours().len(), 0);
     }
 
     /// What the measuring IOProc counts.
@@ -1782,12 +1918,11 @@ mod tests {
     #[ignore = "creates a real tap on the default output"]
     fn a_tap_leaves_no_aggregate_device_behind() {
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
-        let ours = || list_devices().unwrap().iter().filter(|o| o.name == AGGREGATE_NAME).count();
         eprintln!("permission: {:?}", permission());
         let tap = OutputTap::start("", 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
         eprintln!("tapping {:?} at {} Hz", tap.device, tap.sample_rate);
-        assert_eq!(ours(), 1, "the private aggregate is visible to its own process");
+        assert_eq!(ours().len(), 1, "the private aggregate is visible to its own process");
         drop(tap);
-        assert_eq!(ours(), 0);
+        assert_eq!(ours().len(), 0);
     }
 }
