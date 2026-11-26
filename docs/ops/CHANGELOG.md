@@ -3,6 +3,23 @@
 What got added, per landing — dated with a clock and the jj change id. The entry
 format is stated once in AGENTS.md §2.
 
+## 1.3.0 — 2026-11-26
+
+#### Taps take the I/O buffer size asked for, and stop resampling a device against itself · 2026-11-26 05:06 · puyswytv
+
+- **`set_tap_buffer_frames(Some(n))` sets the I/O buffer size of every
+  tap**, device and app taps alike, for the whole process. A program that
+  asks each device it opens for a buffer size can now ask the taps too:
+  each tap's private aggregate device used to get macOS's default of 512
+  frames whatever was asked. A tap made later asks as it is made; a tap
+  already running changes size in place, without being made again.
+  `None` gives each tap the size it was made with.
+- **A tap of the device that clocks it is no longer drift compensated.**
+  A device tap, and an app tap scoped to the device it is clocked by, run
+  on that device's own clock, so CoreAudio had nothing to correct and
+  ran a resampler on them anyway. A tap of apps wherever they play keeps
+  drift compensation, since its audio may come off another clock.
+
 ## 1.2.2 — 2026-11-26
 
 #### App taps ask CoreAudio about the one app that changed · 2026-11-26 00:26 · wsmsspoq
