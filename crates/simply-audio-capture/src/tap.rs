@@ -33,10 +33,10 @@ use objc2_core_audio_types::{
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 
-use crate::buffers::{Buffers, Frames};
 use crate::apps::{
     self, AppInfo, AppStatus, AppTap, Backend, Follow, Mute, Proc, Remade, STALL, Stall, Target,
 };
+use crate::buffers::{Buffers, Frames};
 use crate::channels::{AppSinks, ChannelsStatus, Split};
 use crate::default_out::{FollowDefault, Now, Outputs};
 use crate::watch::{self, Listen, Listened, Prop, Said, Wake};
@@ -444,6 +444,9 @@ impl Drop for OutputTap {
     }
 }
 
+/// A tap description, and the UID of the one device it hears, if one.
+type Described = (Retained<CATapDescription>, Option<String>);
+
 /// The tap descriptions `kind` needs (private, with its mute behaviour):
 /// one per target, and one per output stream of the device a
 /// [`Target::OnDevice`] names. Each with the UID of the one device its
@@ -456,9 +459,7 @@ impl Drop for OutputTap {
 /// `two_devices_a_scoped_tap_and_the_devices_listener`). Left alone, it
 /// takes the stream's own format, which the IOProc maps to the width asked
 /// for like a device's input (its first channels).
-unsafe fn descriptions(
-    kind: &Kind,
-) -> Result<Vec<(Retained<CATapDescription>, Option<String>)>, Error> {
+unsafe fn descriptions(kind: &Kind) -> Result<Vec<Described>, Error> {
     unsafe {
         let ids = |objects: &[u32]| {
             let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
@@ -2047,5 +2048,91 @@ mod tests {
         assert_eq!(ours().len(), 1, "the private aggregate is visible to its own process");
         drop(tap);
         assert_eq!(ours().len(), 0);
+    }
+
+    /// The hand check for [`crate::set_tap_buffer_frames`] and drift
+    /// compensation, on a real tap of the default output while this process
+    /// plays silence on it: the aggregate's buffer size and the callback's
+    /// frame count follow the wish while the tap runs, and go back with
+    /// `None`; the tap of the clock device is not drift compensated. Prints
+    /// the tap's own format against the aggregate's rate:
+    /// `cargo test -p simply-audio-capture --lib tap::tests::a_running_tap -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "plays silence on the default output and taps it"]
+    fn a_running_tap_takes_the_buffer_size_asked_for() {
+        use cpal::traits::StreamTrait;
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        let player = silence();
+        player.play().unwrap();
+        let rate = find_output("").unwrap();
+        let rate: f64 =
+            get(rate.id, kAudioDevicePropertyNominalSampleRate, kAudioObjectPropertyScopeGlobal)
+                .unwrap();
+        let most = Arc::new(AtomicU64::new(0));
+        let seen = Arc::clone(&most);
+        let tap = OutputTap::start(
+            "",
+            rate.round() as u32,
+            2,
+            Box::new(move |f: &[f32], _: u64| {
+                seen.fetch_max(f.len() as u64 / 2, Ordering::Relaxed);
+            }),
+        )
+        .unwrap();
+        let agg = tap.aggregate;
+        let frames = || get::<u32>(agg, kAudioDevicePropertyBufferFrameSize, 0).unwrap();
+        // The largest slice over 300 ms, from 200 ms after the ask: the
+        // HAL takes a cycle or two to change a running device's size.
+        let callback = || {
+            std::thread::sleep(Duration::from_millis(200));
+            most.store(0, Ordering::Relaxed);
+            std::thread::sleep(Duration::from_millis(300));
+            most.load(Ordering::Relaxed)
+        };
+        let made = frames();
+        eprintln!("made at {made} frames, callback {}", callback());
+        for n in [128, 256, 1024] {
+            set_buffer_frames(Some(n));
+            let (now, call) = (frames(), callback());
+            eprintln!("asked {n}: {now} frames, callback {call}");
+            assert_eq!(now, n);
+            assert_eq!(call, n as u64, "the callback runs at the size asked for");
+        }
+        set_buffer_frames(None);
+        assert_eq!(frames(), made);
+
+        let format: objc2_core_audio_types::AudioStreamBasicDescription =
+            get(tap.taps[0], kAudioTapPropertyFormat, 0).unwrap();
+        let agg_rate: f64 = get(agg, kAudioDevicePropertyNominalSampleRate, 0).unwrap();
+        eprintln!(
+            "tap format {} Hz x {} ch, aggregate {agg_rate} Hz, device {rate} Hz",
+            format.mSampleRate, format.mChannelsPerFrame
+        );
+        // What the aggregate says it is made of: its sub-device and each
+        // sub-tap, with their drift compensation.
+        let ptr: *mut NSDictionary<NSString, AnyObject> =
+            get(agg, kAudioAggregateDevicePropertyComposition, 0).unwrap();
+        let composition = unsafe { Retained::from_raw(ptr) }.unwrap();
+        let drift_of = |list: &CStr| -> Vec<String> {
+            let list = composition.objectForKey(&key(list)).unwrap();
+            let list = list.downcast_ref::<NSArray>().unwrap();
+            list.iter()
+                .map(|entry| {
+                    let entry = entry.downcast_ref::<NSDictionary>().unwrap();
+                    entry
+                        .objectForKey(&*key(kAudioSubTapDriftCompensationKey))
+                        .and_then(|d| d.downcast::<NSNumber>().ok())
+                        .map_or("unset".to_owned(), |d| d.as_u32().to_string())
+                })
+                .collect()
+        };
+        let (devices, taps) = (
+            drift_of(kAudioAggregateDeviceSubDeviceListKey),
+            drift_of(kAudioAggregateDeviceTapListKey),
+        );
+        eprintln!("drift compensation: sub-devices {devices:?}, sub-taps {taps:?}");
+        assert_eq!(taps, ["0"], "a tap of the clock device is not drift compensated");
+        drop(tap);
+        drop(player);
     }
 }
