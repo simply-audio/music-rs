@@ -36,7 +36,7 @@ use crate::apps::{
 };
 use crate::channels::{AppSinks, ChannelsStatus, Split};
 use crate::default_out::{FollowDefault, Now, Outputs};
-use crate::watch::{self, Listen, Listened, Prop, Wake};
+use crate::watch::{self, Listen, Listened, Prop, Said, Wake};
 use crate::{Error, ErrorKind, Feed, Permission, Sink};
 
 type OSStatus = i32;
@@ -648,12 +648,8 @@ unsafe extern "C-unwind" fn io_proc(
 /// don't change for an object's life.
 type Identity = (i32, Option<String>, Option<String>);
 
-/// Every process object the HAL lists, with who it is and whether it is
-/// playing. `cache` keeps identities across calls (pruned to the objects
-/// still listed), so an idle poll costs one property read per process.
-/// With `devices`, also the UIDs of the output devices each one plays into
-/// (a few more reads per process).
-fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>, devices: bool) -> Vec<Proc> {
+/// The process objects the HAL lists. `cache` is pruned to them.
+fn process_objects(cache: &mut HashMap<AudioObjectID, Identity>) -> Vec<AudioObjectID> {
     let objects: Vec<AudioObjectID> = get_vec(
         kAudioObjectSystemObject as AudioObjectID,
         kAudioHardwarePropertyProcessObjectList,
@@ -661,41 +657,47 @@ fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>, devices: bool) -
     )
     .unwrap_or_default();
     cache.retain(|o, _| objects.contains(o));
-    let mut procs = Vec::with_capacity(objects.len());
-    for object in objects {
-        let identity = match cache.get(&object) {
-            Some(i) => i.clone(),
-            None => {
-                let Ok(pid) =
-                    get::<i32>(object, kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal)
-                else {
-                    continue; // on its way out
-                };
-                let bundle = get_string(object, kAudioProcessPropertyBundleID)
-                    .ok()
-                    .filter(|b| !b.is_empty());
-                let i = (pid, bundle, pid_path(pid));
-                cache.insert(object, i.clone());
-                i
-            }
-        };
-        let playing = get::<u32>(
-            object,
-            kAudioProcessPropertyIsRunningOutput,
-            kAudioObjectPropertyScopeGlobal,
-        )
-        .is_ok_and(|v| v == 1);
-        let (pid, bundle, exe) = identity;
-        let devices = match devices {
-            true => output_devices(object)
-                .into_iter()
-                .filter_map(|d| get_string(d, kAudioDevicePropertyDeviceUID).ok())
-                .collect(),
-            false => Vec::new(),
-        };
-        procs.push(Proc { object, pid, bundle, exe, playing, devices });
-    }
-    procs
+    objects
+}
+
+/// One process object: who it is (from `cache`, read once per object) and
+/// whether it is playing, one property read once its identity is known.
+/// With `devices`, also the UIDs of the output devices it plays into (a few
+/// more reads). `None`: it is on its way out.
+fn read_process(
+    cache: &mut HashMap<AudioObjectID, Identity>,
+    object: AudioObjectID,
+    devices: bool,
+) -> Option<Proc> {
+    let identity = match cache.get(&object) {
+        Some(i) => i.clone(),
+        None => {
+            let pid = get::<i32>(object, kAudioProcessPropertyPID, kAudioObjectPropertyScopeGlobal)
+                .ok()?;
+            let bundle =
+                get_string(object, kAudioProcessPropertyBundleID).ok().filter(|b| !b.is_empty());
+            let i = (pid, bundle, pid_path(pid));
+            cache.insert(object, i.clone());
+            i
+        }
+    };
+    let playing =
+        get::<u32>(object, kAudioProcessPropertyIsRunningOutput, kAudioObjectPropertyScopeGlobal)
+            .is_ok_and(|v| v == 1);
+    let (pid, bundle, exe) = identity;
+    let devices = match devices {
+        true => output_devices(object)
+            .into_iter()
+            .filter_map(|d| get_string(d, kAudioDevicePropertyDeviceUID).ok())
+            .collect(),
+        false => Vec::new(),
+    };
+    Some(Proc { object, pid, bundle, exe, playing, devices })
+}
+
+/// Every process object the HAL lists, read ([`read_process`]).
+fn list_processes(cache: &mut HashMap<AudioObjectID, Identity>, devices: bool) -> Vec<Proc> {
+    process_objects(cache).into_iter().filter_map(|o| read_process(cache, o, devices)).collect()
 }
 
 /// The output devices a process object plays to.
@@ -764,6 +766,14 @@ impl Backend for Hal {
         list_processes(&mut self.cache, self.devices)
     }
 
+    fn objects(&mut self) -> Vec<u32> {
+        process_objects(&mut self.cache)
+    }
+
+    fn process(&mut self, object: u32) -> Option<Proc> {
+        read_process(&mut self.cache, object, self.devices)
+    }
+
     fn translate(&mut self, pid: i32) -> Option<u32> {
         translate_pid(pid)
     }
@@ -812,14 +822,31 @@ const TICK: Duration = Duration::from_millis(500);
 /// devices): the backstop for what that listener would have said.
 const FALLBACK: Duration = Duration::from_secs(5);
 
+/// How long an app follower woken by a listener waits for more before it
+/// looks: browsers and chat apps start and stop several audio sessions at
+/// once, and the burst costs one look.
+const SETTLE: Duration = Duration::from_millis(250);
+
+/// Tells the follower what changed: a process object's property, the
+/// system object's process list, or something else on the system object.
 unsafe extern "C-unwind" fn on_change(
-    _object: AudioObjectID,
-    _count: u32,
-    _addresses: NonNull<AudioObjectPropertyAddress>,
+    object: AudioObjectID,
+    count: u32,
+    addresses: NonNull<AudioObjectPropertyAddress>,
     client: *mut c_void,
 ) -> OSStatus {
     unsafe {
-        (*(client as *const Wake)).poke(false);
+        let said = if object != kAudioObjectSystemObject as AudioObjectID {
+            Said::Process(object)
+        } else if std::slice::from_raw_parts(addresses.as_ptr(), count as usize)
+            .iter()
+            .any(|a| a.mSelector == kAudioHardwarePropertyProcessObjectList)
+        {
+            Said::List
+        } else {
+            Said::Look
+        };
+        (*(client as *const Wake)).heard(said);
         0
     }
 }
@@ -937,9 +964,10 @@ impl Listen for ProcessListen {
     }
 }
 
-/// What pokes an app follower: a process came or went, a device list
-/// changed. (And a process started or stopped playing, or its devices
-/// changed: [`ProcessListen`].)
+/// What pokes an app follower: a process came or went (the list and the
+/// new processes are read), a device list changed (a look, no process
+/// read: a process that moves off a device says so itself). (And a process
+/// started or stopped playing, or its devices changed: [`ProcessListen`].)
 const APPS_WATCHED: [AudioObjectPropertySelector; 2] =
     [kAudioHardwarePropertyProcessObjectList, kAudioHardwarePropertyDevices];
 
@@ -986,7 +1014,7 @@ impl Following {
         tick: Duration,
     ) -> Result<Following, Error> {
         let status = Arc::new(Mutex::new((AppStatus::Failed { error: "starting".into() }, None)));
-        let wake = Arc::new(Wake::new(tick));
+        let wake = Arc::new(Wake::new(tick).settling(SETTLE));
         let backend = app_backend(&tap, rate, channels, &wake);
         let mut follow = Follow::new(backend, tap, std::process::id() as i32, sink);
         let shared = Arc::clone(&status);
@@ -1028,7 +1056,7 @@ impl Channels {
         sinks: S,
     ) -> Result<Channels, Error> {
         let status = Arc::new(Mutex::new(ChannelsStatus::default()));
-        let wake = Arc::new(Wake::new(TICK));
+        let wake = Arc::new(Wake::new(TICK).settling(SETTLE));
         let backend = app_backend(&tap, rate, channels, &wake);
         let mut split = Split::new(backend, tap, std::process::id() as i32, sinks);
         let shared = Arc::clone(&status);

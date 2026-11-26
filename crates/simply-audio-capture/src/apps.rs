@@ -312,6 +312,14 @@ pub(crate) trait Backend {
     type Tap;
     /// Every process object the HAL lists now.
     fn processes(&mut self) -> Vec<Proc>;
+    /// The process objects the HAL lists now, without reading them.
+    fn objects(&mut self) -> Vec<u32> {
+        self.processes().into_iter().map(|p| p.object).collect()
+    }
+    /// One process object, read now; `None` if it is gone.
+    fn process(&mut self, object: u32) -> Option<Proc> {
+        self.processes().into_iter().find(|p| p.object == object)
+    }
     /// `kAudioHardwarePropertyTranslatePIDToProcessObject`: the process
     /// object of `pid`, if it is an audio client.
     fn translate(&mut self, pid: i32) -> Option<u32>;
