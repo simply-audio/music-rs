@@ -27,10 +27,13 @@ use objc2::AnyThread;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
 use objc2_core_audio::*;
-use objc2_core_audio_types::{AudioBuffer, AudioBufferList, AudioTimeStamp, AudioTimeStampFlags};
+use objc2_core_audio_types::{
+    AudioBuffer, AudioBufferList, AudioTimeStamp, AudioTimeStampFlags, AudioValueRange,
+};
 use objc2_core_foundation::CFDictionary;
 use objc2_foundation::{NSArray, NSDictionary, NSNumber, NSString, NSUUID};
 
+use crate::buffers::{Buffers, Frames};
 use crate::apps::{
     self, AppInfo, AppStatus, AppTap, Backend, Follow, Mute, Proc, Remade, STALL, Stall, Target,
 };
@@ -221,6 +224,40 @@ fn app_clock() -> (Option<String>, u64) {
     APP_CLOCK.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
+/// The I/O buffer size asked of every tap's aggregate, and the open ones
+/// ([`crate::set_tap_buffer_frames`]).
+static BUFFERS: Mutex<Buffers<AudioObjectID>> = Mutex::new(Buffers::new());
+
+fn buffers() -> std::sync::MutexGuard<'static, Buffers<AudioObjectID>> {
+    BUFFERS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Every tap's aggregate asks for `frames` from now on (`None`: macOS's
+/// default), the open ones at once.
+pub(crate) fn set_buffer_frames(frames: Option<u32>) {
+    buffers().wish(frames, &mut HalFrames);
+}
+
+/// A device's `kAudioDevicePropertyBufferFrameSize`, through the HAL.
+struct HalFrames;
+
+impl Frames<AudioObjectID> for HalFrames {
+    fn get(&mut self, device: &AudioObjectID) -> Option<u32> {
+        get(*device, kAudioDevicePropertyBufferFrameSize, kAudioObjectPropertyScopeGlobal).ok()
+    }
+
+    fn range(&mut self, device: &AudioObjectID) -> Option<(u32, u32)> {
+        let r: AudioValueRange =
+            get(*device, kAudioDevicePropertyBufferFrameSizeRange, kAudioObjectPropertyScopeGlobal)
+                .ok()?;
+        Some((r.mMinimum.ceil() as u32, r.mMaximum.floor() as u32))
+    }
+
+    fn set(&mut self, device: &AudioObjectID, frames: u32) -> bool {
+        set(*device, kAudioDevicePropertyBufferFrameSize, frames).is_ok()
+    }
+}
+
 // The raw pointer is only touched by CoreAudio's IO thread between
 // AudioDeviceStart and AudioDeviceStop, and freed after the stop.
 unsafe impl Send for OutputTap {}
@@ -294,11 +331,13 @@ impl OutputTap {
         unsafe {
             let uid = NSString::from_str(&clock.uid);
             let mut tap_uids = Vec::new();
-            for desc in descriptions(kind)? {
-                tap_uids.push(create_tap(&desc, &mut self.taps)?);
+            for (desc, source) in descriptions(kind)? {
+                let drift = drifts(source.as_deref(), &clock.uid);
+                tap_uids.push((create_tap(&desc, &mut self.taps)?, drift));
             }
-            let refs: Vec<&NSString> = tap_uids.iter().map(|u| &**u).collect();
+            let refs: Vec<(&NSString, bool)> = tap_uids.iter().map(|(u, d)| (&**u, *d)).collect();
             self.aggregate = create_aggregate(&uid, &refs)?;
+            buffers().opened(self.aggregate, &mut HalFrames);
             // The rate the IOProc runs at is the aggregate's, clocked by the
             // tapped device. (The tap's own format property said 48000 for
             // speakers running at 44100 — measured — so it isn't used.)
@@ -393,6 +432,9 @@ impl Drop for OutputTap {
         drop(self.take_sink());
         unsafe {
             if self.aggregate != 0 {
+                // Out of the open ones before it goes: a wish being applied
+                // holds the lock, so it never asks a destroyed device.
+                buffers().closed(&self.aggregate);
                 AudioHardwareDestroyAggregateDevice(self.aggregate);
             }
             for &tap in &self.taps {
@@ -404,7 +446,9 @@ impl Drop for OutputTap {
 
 /// The tap descriptions `kind` needs (private, with its mute behaviour):
 /// one per target, and one per output stream of the device a
-/// [`Target::OnDevice`] names.
+/// [`Target::OnDevice`] names. Each with the UID of the one device its
+/// audio comes from, when there is one: a device tap's, an
+/// [`Target::OnDevice`]'s; a tap of processes wherever they play has none.
 ///
 /// Every tap is a stereo mixdown except a [`Target::OnDevice`] one: a
 /// mixdown tap of processes on one device stream is not scoped to it at
@@ -412,14 +456,17 @@ impl Drop for OutputTap {
 /// `two_devices_a_scoped_tap_and_the_devices_listener`). Left alone, it
 /// takes the stream's own format, which the IOProc maps to the width asked
 /// for like a device's input (its first channels).
-unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, Error> {
+unsafe fn descriptions(
+    kind: &Kind,
+) -> Result<Vec<(Retained<CATapDescription>, Option<String>)>, Error> {
     unsafe {
         let ids = |objects: &[u32]| {
             let n: Vec<_> = objects.iter().map(|o| NSNumber::new_u32(*o)).collect();
             NSArray::from_retained_slice(&n)
         };
         let alloc = CATapDescription::alloc;
-        let mut descs: Vec<(Retained<CATapDescription>, bool)> = Vec::new(); // (desc, mixdown)
+        // (desc, mixdown, the device it hears)
+        let mut descs: Vec<(Retained<CATapDescription>, bool, Option<String>)> = Vec::new();
         let mute = match kind {
             Kind::Device(d) => {
                 let uid = NSString::from_str(&d.uid);
@@ -432,6 +479,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
                         0,
                     ),
                     true,
+                    Some(d.uid.clone()),
                 ));
                 Mute::Unmuted
             }
@@ -441,6 +489,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
                         Target::Processes(o) => descs.push((
                             CATapDescription::initStereoMixdownOfProcesses(alloc(), &ids(o)),
                             true,
+                            None,
                         )),
                         Target::AllExcept(o) => descs.push((
                             CATapDescription::initStereoGlobalTapButExcludeProcesses(
@@ -448,6 +497,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
                                 &ids(o),
                             ),
                             true,
+                            None,
                         )),
                         Target::OnDevice(o, uid) => {
                             let uid_ns = NSString::from_str(uid);
@@ -459,7 +509,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
                                         &uid_ns,
                                         stream as _,
                                     );
-                                descs.push((desc, false));
+                                descs.push((desc, false, Some(uid.clone())));
                             }
                         }
                     }
@@ -475,7 +525,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
         let name = NSString::from_str(AGGREGATE_NAME);
         Ok(descs
             .into_iter()
-            .map(|(desc, mixdown)| {
+            .map(|(desc, mixdown, source)| {
                 desc.setName(&name);
                 if mixdown {
                     desc.setMixdown(true);
@@ -483,7 +533,7 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Retained<CATapDescription>>, E
                 }
                 desc.setPrivate(true);
                 desc.setMuteBehavior(mute);
-                desc
+                (desc, source)
             })
             .collect())
     }
@@ -525,21 +575,36 @@ fn key(k: &CStr) -> Retained<NSString> {
     NSString::from_str(k.to_str().unwrap_or_default())
 }
 
+/// Whether a tap of the device `source` (`None`: of processes wherever they
+/// play) needs drift compensation in an aggregate clocked by `clock`: unless
+/// it hears the clock device itself, its audio runs on another clock, and
+/// the aggregate resamples it to keep the two in step. A tap of the clock
+/// device runs on the aggregate's own clock, and compensating it would
+/// only be a resampler with nothing to correct.
+fn drifts(source: Option<&str>, clock: &str) -> bool {
+    source != Some(clock)
+}
+
 /// A private aggregate device clocked by (and holding) the device `clock`,
-/// with the taps `taps` (by UID) as its inputs, started automatically.
-unsafe fn create_aggregate(clock: &NSString, taps: &[&NSString]) -> Result<AudioObjectID, Error> {
+/// with the taps `taps` (by UID, each with whether it is drift compensated,
+/// [`drifts`]) as its inputs, started automatically. The clock device
+/// itself is never drift compensated: it is the time base.
+unsafe fn create_aggregate(
+    clock: &NSString,
+    taps: &[(&NSString, bool)],
+) -> Result<AudioObjectID, Error> {
     unsafe {
+        let (yes, no) = (NSNumber::new_bool(true), NSNumber::new_bool(false));
         let sub_device = NSDictionary::<NSString, AnyObject>::from_slices(
-            &[&*key(kAudioSubDeviceUIDKey)],
-            &[clock as &AnyObject],
+            &[&*key(kAudioSubDeviceUIDKey), &*key(kAudioSubDeviceDriftCompensationKey)],
+            &[clock as &AnyObject, &*no],
         );
-        let yes = NSNumber::new_bool(true);
         let sub_taps: Vec<_> = taps
             .iter()
-            .map(|uid| {
+            .map(|&(uid, drift)| {
                 NSDictionary::<NSString, AnyObject>::from_slices(
                     &[&*key(kAudioSubTapUIDKey), &*key(kAudioSubTapDriftCompensationKey)],
-                    &[*uid as &AnyObject, &*yes],
+                    &[uid as &AnyObject, if drift { &*yes } else { &*no }],
                 )
             })
             .collect();
@@ -1198,6 +1263,28 @@ fn get<T: Copy>(
     }
 }
 
+/// Set one fixed-size, global property value.
+fn set<T: Copy>(
+    obj: AudioObjectID,
+    selector: AudioObjectPropertySelector,
+    value: T,
+) -> Result<(), Error> {
+    let addr = address(selector, kAudioObjectPropertyScopeGlobal);
+    unsafe {
+        check(
+            AudioObjectSetPropertyData(
+                obj,
+                NonNull::from(&addr),
+                0,
+                std::ptr::null(),
+                std::mem::size_of::<T>() as u32,
+                NonNull::from(&value).cast(),
+            ),
+            "setting an audio property",
+        )
+    }
+}
+
 /// An array property (device lists, stream lists).
 fn get_vec<T: Copy + Default>(
     obj: AudioObjectID,
@@ -1248,6 +1335,14 @@ fn get_string(obj: AudioObjectID, selector: AudioObjectPropertySelector) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A tap of the clock device is not drift compensated; any other is.
+    #[test]
+    fn only_a_tap_off_another_clock_is_drift_compensated() {
+        assert!(!drifts(Some("BuiltInSpeakerDevice"), "BuiltInSpeakerDevice"));
+        assert!(drifts(Some("BlackHole2ch_UID"), "BuiltInSpeakerDevice"));
+        assert!(drifts(None, "BuiltInSpeakerDevice"), "processes wherever they play");
+    }
 
     /// Setting the app taps' clock counts only a change: a running tap
     /// is made again when it moves, never when it is set to what it was.
@@ -1825,12 +1920,12 @@ mod tests {
         unsafe {
             let mut made = Vec::new();
             let mut tap_of = |object| {
-                let desc = descriptions(&one(object)).unwrap().remove(0);
+                let (desc, _) = descriptions(&one(object)).unwrap().remove(0);
                 create_tap(&desc, &mut made).unwrap()
             };
             let (uid_a, uid_b) = (tap_of(me), tap_of(other.object));
             let clock_uid = NSString::from_str(&clock.uid);
-            let agg = create_aggregate(&clock_uid, &[&uid_a]).unwrap();
+            let agg = create_aggregate(&clock_uid, &[(&uid_a, true)]).unwrap();
             let probe = Box::into_raw(Box::new(Probe::default()));
             let mut proc_id: AudioDeviceIOProcID = None;
             check(

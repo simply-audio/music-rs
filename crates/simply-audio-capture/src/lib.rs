@@ -109,6 +109,8 @@
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod apps;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod buffers;
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod channels;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod default_out;
@@ -516,6 +518,29 @@ pub fn set_app_tap_clock(device: Option<&str>) {
     tap::set_app_clock(device.map(str::to_owned));
     #[cfg(not(target_os = "macos"))]
     let _ = device;
+}
+
+/// Ask every tap's private aggregate device for an I/O buffer of `frames`
+/// (`kAudioDevicePropertyBufferFrameSize`), process-wide, from now on:
+/// device taps ([`start`] of an output, the followed default output) and
+/// app taps ([`start_app`], [`start_app_channels`]) alike. `None` leaves
+/// each aggregate at macOS's default (512 frames, measured on macOS 26).
+///
+/// A tap made from now on (a new one, or one made again on a new clock, a
+/// new default output or a restarted app) asks for it as it is made. The
+/// taps already running are asked at once, from the calling thread, without
+/// being made again: the HAL changes a running device's buffer size between
+/// two I/O cycles, and the taps' callback takes any frame count. `None`
+/// gives them back the size they were made with. A size the aggregate
+/// doesn't take is held to the nearest it does; a refusal leaves it as it
+/// was. macOS keeps a buffer size per process and device, and the
+/// aggregates are private to this process, so no other program is touched.
+/// Off macOS: nothing.
+pub fn set_tap_buffer_frames(frames: Option<u32>) {
+    #[cfg(target_os = "macos")]
+    tap::set_buffer_frames(frames);
+    #[cfg(not(target_os = "macos"))]
+    let _ = frames;
 }
 
 /// Why `tap` can't be followed here, if it can't: it names no app,
