@@ -3,6 +3,24 @@
 What got added, per landing — dated with a clock and the jj change id. The entry
 format is stated once in AGENTS.md §2.
 
+## 1.2.2 — 2026-11-26
+
+#### App taps ask CoreAudio about the one app that changed · 2026-11-26 00:26 · wsmsspoq
+
+- **An app tap no longer re-reads every audio process when one of them
+  changes.** Browsers and chat apps start and stop audio sessions all the
+  time, and each one used to make the tap ask CoreAudio about every
+  process again, which kept `coreaudiod` busy. Now an app starting,
+  stopping or moving costs one question about that app; an app becoming or
+  stopping being an audio client costs the list and the new app, nothing
+  about the others; a device coming or going costs no process question at
+  all.
+- A burst of changes (a browser opening several sessions at once) costs one
+  look: the tap waits a quarter of a second after the first before it
+  looks. An app that starts playing is picked up that much later.
+- Where CoreAudio refuses a listener on one app, only that app is read
+  again every 5 s, not the whole list.
+
 ## 1.2.1 — 2026-11-25
 
 #### App taps wait to be told, and `list_devices` stops listing their own aggregate · 2026-11-25 23:56 · pnwxskyq
