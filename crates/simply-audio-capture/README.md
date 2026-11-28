@@ -48,7 +48,7 @@ println!("{}", capture.status()); // "waiting for com.algoriddim.djay-iphone-fre
 
 The taps run on **macOS 14.2+** (CoreAudio process taps) and **Windows 11** (WASAPI loopback). Elsewhere the code compiles and devices are captured like any other cpal project, but `Tap` is never resolved and app taps fail at once. `cargo check --workspace --all-targets --target x86_64-pc-windows-msvc` is the check from a Mac.
 
-On Windows an output tap is endpoint loopback, kept delivering by a silent stream of its own while nothing plays; an app tap is process loopback of the app's process tree, wherever it plays. Windows has no tap mute and no "everything except": a muted app tap and `Apps::AllExcept` are refused with `ErrorKind::Unsupported`. Apps playing through ASIO or exclusive mode can't be tapped.
+On Windows an output tap is endpoint loopback, kept delivering by a silent stream of its own while nothing plays, and it hears this process too; an app tap is process loopback of the app's process tree, wherever it plays. Windows has no tap mute and no "everything except": a muted app or device tap and `Apps::AllExcept` are refused with `ErrorKind::Unsupported`. Apps playing through ASIO or exclusive mode can't be tapped.
 
 `tests/windows_tones.rs` checks it on a real audio engine: child processes play 997 Hz and 1499 Hz, and a spectrum says which tones each capture heard. On Windows: `cargo test -p simply-audio-capture --test windows_tones -- --ignored --test-threads=1`. The *Windows taps* GitHub workflow (run by hand) runs it on a hosted runner, with the Scream virtual sound card installed as its audio endpoint.
 

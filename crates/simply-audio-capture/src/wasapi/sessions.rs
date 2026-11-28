@@ -50,6 +50,9 @@ const ACTIVATION: Duration = Duration::from_secs(5);
 /// Why a muted app tap is refused on Windows.
 pub(crate) const NO_MUTE: &str = "a muted app tap is not possible on Windows: muting an \
 app's audio session silences what is tapped of it too; tap it unmuted";
+/// Why a muted device tap is refused on Windows.
+pub(crate) const NO_DEVICE_MUTE: &str = "a muted device tap is not possible on Windows: \
+endpoint loopback has no mute; tap it unmuted";
 /// Why an "everything except" tap is refused on Windows.
 pub(crate) const NO_ALL_EXCEPT: &str = "tapping every app except some is not possible on \
 Windows: tap the apps by name, or tap the output they play into";

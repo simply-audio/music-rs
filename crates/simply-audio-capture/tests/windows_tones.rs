@@ -297,6 +297,10 @@ fn a_muted_tap_and_everything_except_are_refused() {
     let all = AppTap::all_except([App::This]);
     let e = simply_audio_capture::start_app(&all, RATE, 2, |_: &[f32], _: u64| {}).err();
     assert_eq!(e.map(|e| e.kind()), Some(ErrorKind::Unsupported));
+    let tap = Source::Tap(String::new());
+    let e =
+        simply_audio_capture::start_with_mute(&tap, Mute::Muted, RATE, 2, |_: &[f32], _| {}).err();
+    assert_eq!(e.map(|e| e.kind()), Some(ErrorKind::Unsupported));
 }
 
 #[test]

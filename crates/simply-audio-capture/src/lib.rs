@@ -85,7 +85,8 @@
 //! * an output by name, or `""` for the default output, followed when it
 //!   changes, is **endpoint loopback** of that render endpoint. A silent
 //!   stream of this process's own plays into it meanwhile, so the tap
-//!   delivers (digital silence) while nothing else plays;
+//!   delivers (digital silence) while nothing else plays. Endpoint
+//!   loopback hears every process on the endpoint, this one included;
 //! * [`start_app`] and [`start_app_channels`] are **process loopback**:
 //!   one client per process *tree* (a browser's audio helper comes with
 //!   the browser), wherever it plays; several apps in one [`start_app`]
@@ -93,8 +94,9 @@
 //!   or without `.exe`) or its pid; Windows has no bundle ids.
 //!
 //! What Windows can't do is refused with [`ErrorKind::Unsupported`]: a
-//! muted tap ([`Mute::Muted`], [`Mute::MutedWhenTapped`]: muting an app's
-//! session silences its loopback too) and [`Apps::AllExcept`]. Loopback
+//! muted tap, of an app or a device ([`Mute::Muted`],
+//! [`Mute::MutedWhenTapped`]: muting an app's session silences its
+//! loopback too) and [`Apps::AllExcept`]. Loopback
 //! needs no consent ([`permission`] is granted). The audio engine converts
 //! to the width and rate asked for, and delivers once per engine period
 //! (10 ms), so [`set_tap_buffer_frames`] and [`set_app_tap_clock`] do
@@ -431,9 +433,10 @@ where
 /// [`start`], with whether a tap mutes what it taps, as an app tap's
 /// [`AppTap::mute`] does: [`Mute::Muted`] silences every process the tap
 /// hears on that device while it is captured, so they reach this process
-/// and not the speakers. This process is never tapped, so it is never
-/// muted either: what it plays on the device is still heard. An input
-/// can't be muted, so it takes only [`Mute::Unmuted`].
+/// and not the speakers. On macOS this process is never tapped, so it is
+/// never muted either: what it plays on the device is still heard. An
+/// input can't be muted, so it takes only [`Mute::Unmuted`], and neither
+/// can a device tap on Windows.
 pub fn start_with_mute<F>(
     source: &Source,
     mute: Mute,
@@ -487,6 +490,9 @@ where
         // No consent to check: loopback needs none on Windows.
         #[cfg(windows)]
         Source::Tap(name) => {
+            if mute != Mute::Unmuted {
+                return Err(Error::new(ErrorKind::Unsupported, wasapi::NO_DEVICE_MUTE));
+            }
             if name.is_empty() {
                 let t = wasapi::DefaultTap::start(rate, channels as usize, Box::new(sink))?;
                 return Ok(Capture {

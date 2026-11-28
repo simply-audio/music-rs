@@ -14,7 +14,7 @@ mod endpoints;
 mod sessions;
 
 pub(crate) use endpoints::{DefaultTap, OutputTap, list_devices};
-pub(crate) use sessions::{Channels, Following, NO_ALL_EXCEPT, NO_MUTE, list_apps};
+pub(crate) use sessions::{Channels, Following, NO_ALL_EXCEPT, NO_DEVICE_MUTE, NO_MUTE, list_apps};
 
 use std::cell::Cell;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
