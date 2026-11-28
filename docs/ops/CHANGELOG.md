@@ -3,6 +3,30 @@
 What got added, per landing — dated with a clock and the jj change id. The entry
 format is stated once in AGENTS.md §2.
 
+## Unreleased
+
+#### Output and app taps on Windows · 2026-11-28 19:48 · xtwmotmu
+
+- **Tapping an output works on Windows**, through the same calls as on the
+  Mac: `list_devices` lists the outputs, `start(Source::Tap(name))` taps
+  one, and `Source::Tap("")` taps the default output and moves with it
+  when it changes. A tap keeps delivering, as silence, while nothing
+  plays, so silence never reads as a stalled tap.
+- **Tapping apps works on Windows**: `start_app` taps the apps named
+  (by executable, `Spotify` or `Spotify.exe`, or by pid), each with its
+  child processes, wherever they play, several apps summed into one
+  stream; `start_app_channels` gives each app its own channel.
+  `list_apps` lists every process with audio.
+- **What Windows can't do is refused with a message**, not faked: a muted
+  tap, of an app or a device (muting an app on Windows silences what is
+  tapped of it too), and "every app except these". A tap of an output
+  on Windows hears this program's own playback too. Apps playing through ASIO or exclusive
+  mode can't be tapped on Windows at all.
+- A two-tone test checks it on a real Windows audio engine (`tests/windows_tones.rs`,
+  `wmplusxs`), and a hand-run GitHub workflow runs it on x64 and ARM64
+  runners given a virtual sound card (`xxwmvvmo`). Nothing changes on
+  the Mac.
+
 ## 1.4.0 — 2026-11-28
 
 #### A tap of your speakers leaves you out, and can silence what it taps · 2026-11-28 19:50 · ztnosqvr
