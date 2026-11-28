@@ -3,6 +3,21 @@
 What got added, per landing — dated with a clock and the jj change id. The entry
 format is stated once in AGENTS.md §2.
 
+## 1.4.0 — 2026-11-28
+
+#### A tap of your speakers leaves you out, and can silence what it taps · 2026-11-28 19:50 · ztnosqvr
+
+- **Tapping an output never records the program doing the tapping.** A tap
+  of a named output, or of the default output as it follows it, hears every
+  process playing there except the one that made the tap. A program that
+  taps the speakers and plays back through them no longer hears its own
+  playback coming round again.
+- **A device tap can mute what it taps**, as an app tap can:
+  `start_with_mute(source, Mute::Muted, …)` captures everything playing on
+  the device and silences it there, so you hear it once, through the
+  program. The program's own playback is not tapped, so it is not muted.
+  `start` is unchanged: not muted. An input can't be muted, and says so.
+
 ## 1.3.0 — 2026-11-26
 
 #### Taps take the I/O buffer size asked for, and stop resampling a device against itself · 2026-11-26 05:06 · puyswytv
