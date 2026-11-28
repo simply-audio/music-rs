@@ -1,0 +1,54 @@
+# The Windows taps on a real audio engine, run by hand only
+# (Actions ▸ Windows taps ▸ Run workflow): the WASAPI loopback tests in
+# simply-audio-capture, which open real devices and are ignored by default.
+#
+# Hosted Windows runners have no audio endpoint, so each job installs the
+# Scream virtual sound card first: a signed render device with nothing
+# behind it, which is all endpoint and process loopback need.
+name: Windows taps
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  taps:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            arch: x64
+          - runner: windows-11-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install a virtual sound card (Scream)
+        shell: pwsh
+        run: |
+          $arch = "${{ matrix.arch }}"
+          Invoke-WebRequest -Uri https://github.com/duncanthrax/scream/releases/download/4.0/Scream4.0.zip -OutFile Scream4.0.zip
+          Expand-Archive -Path Scream4.0.zip -DestinationPath Scream
+          $cert = (Get-AuthenticodeSignature "Scream\Install\driver\$arch\Scream.sys").SignerCertificate
+          $store = [System.Security.Cryptography.X509Certificates.X509Store]::new("TrustedPublisher", "LocalMachine")
+          $store.Open("ReadWrite")
+          $store.Add($cert)
+          $store.Close()
+          & "Scream\Install\helpers\devcon-$arch.exe" install "Scream\Install\driver\$arch\Scream.inf" *Scream
+          if ($LASTEXITCODE -gt 1) { throw "devcon install failed with exit code $LASTEXITCODE" }
+          Start-Service -Name Audiosrv -ErrorAction SilentlyContinue
+          Get-PnpDevice -Class MEDIA -ErrorAction SilentlyContinue | Format-Table -AutoSize Status, FriendlyName
+
+      - name: Tests that need no device
+        run: cargo test --locked -p simply-audio-capture
+
+      - name: Two-tone loopback tests
+        run: cargo test --locked -p simply-audio-capture --test windows_tones -- --ignored --test-threads=1 --nocapture

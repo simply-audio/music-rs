@@ -19,7 +19,7 @@ Canonical musical definitions, performance sequencing models, and tool contracts
 | [`simply-midi-clock`](crates/simply-midi-clock) | MIDI beat clock out: the real-time messages, the follower's position, sleep-then-spin pacing, and output-port selection. |
 | [`simply-link-midi`](crates/simply-link-midi) | The `simply-link` binary — an Ableton Link session out as MIDI beat clock, phase-aligned to the session's quantum. |
 | [`simply-audio-device`](crates/simply-audio-device) | cpal audio-device helpers: name enumeration and named-device selection. |
-| [`simply-audio-capture`](crates/simply-audio-capture) | Capture any audio device by name: its inputs, or what an output-only device plays through a CoreAudio process tap; or applications, followed as they come and go; resampled to the rate asked for. The taps are macOS 14.2+. |
+| [`simply-audio-capture`](crates/simply-audio-capture) | Capture any audio device by name: its inputs, or what an output-only device plays through a CoreAudio process tap or WASAPI loopback; or applications, followed as they come and go; resampled to the rate asked for. The taps are macOS 14.2+ and Windows 11. |
 | [`audiowatch-record`](crates/audiowatch-record) | Record any channel pair of any audio device to 32-bit float WAV, for a length or trimmed to a window of host time. |
 | [`audiowatch-clock`](crates/audiowatch-clock) | Record in time with a MIDI clock: its downbeats off a MIDI input, takes trimmed to the bars between them. |
 | [`audiowatch`](crates/audiowatch) | The `audiowatch` binary: the watcher is macOS only, the recorder runs anywhere. |

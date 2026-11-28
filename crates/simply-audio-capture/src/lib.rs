@@ -78,12 +78,36 @@
 //! An [`AppSinks`] hears each channel start (and hands back its sink) and
 //! stop; [`AppChannels::status`] lists them. See its docs for an example.
 //!
+//! # Windows
+//!
+//! The same calls tap through WASAPI loopback (Windows 11, x64 and ARM64):
+//!
+//! * an output by name, or `""` for the default output, followed when it
+//!   changes, is **endpoint loopback** of that render endpoint. A silent
+//!   stream of this process's own plays into it meanwhile, so the tap
+//!   delivers (digital silence) while nothing else plays;
+//! * [`start_app`] and [`start_app_channels`] are **process loopback**:
+//!   one client per process *tree* (a browser's audio helper comes with
+//!   the browser), wherever it plays; several apps in one [`start_app`]
+//!   are summed here. An app is its executable ([`App::Executable`], with
+//!   or without `.exe`) or its pid; Windows has no bundle ids.
+//!
+//! What Windows can't do is refused with [`ErrorKind::Unsupported`]: a
+//! muted tap ([`Mute::Muted`], [`Mute::MutedWhenTapped`]: muting an app's
+//! session silences its loopback too) and [`Apps::AllExcept`]. Loopback
+//! needs no consent ([`permission`] is granted). The audio engine converts
+//! to the width and rate asked for, and delivers once per engine period
+//! (10 ms), so [`set_tap_buffer_frames`] and [`set_app_tap_clock`] do
+//! nothing there. Apps that play through ASIO or WASAPI exclusive mode
+//! bypass the engine and can't be tapped at all.
+//!
 //! # The sink
 //!
 //! `sink(frames, capture_ns)` gets interleaved `channels`-wide frames at the
 //! requested rate, and the host time (nanoseconds, the
-//! `mach_absolute_time` clock on macOS) at which the slice's first frame was
-//! captured, or 0 when the device did not say. It runs on the device's
+//! `mach_absolute_time` clock on macOS, `QueryPerformanceCounter` on
+//! Windows) at which the slice's first frame was captured, or 0 when the
+//! device did not say. It runs on the device's
 //! real-time thread: it must not allocate, lock, block or log. Copy into a
 //! lock-free ring and return.
 //!
@@ -188,7 +212,8 @@ pub enum ErrorKind {
     /// macOS refused: Microphone for an input, System Audio Recording for a
     /// tap. Only a person can fix it.
     PermissionDenied,
-    /// Not possible here: a tap off macOS or before 14.2.
+    /// Not possible here: a tap off macOS and Windows or before macOS
+    /// 14.2; on Windows, a muted app tap or one of every app except some.
     Unsupported,
     /// The device or the OS failed.
     Device,

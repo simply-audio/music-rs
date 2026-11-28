@@ -53,7 +53,7 @@ const BUFFER_HNS: i64 = 1_000_000; // 100 ms, in 100 ns units
 const PROCESS_BUFFER_HNS: i64 = 200_000; // 20 ms
 /// How long the reading thread waits for the engine's event before it
 /// looks anyway (an event not signalled must not stop the reading).
-const WAIT_MS: u32 = 20;
+const WAIT_MS: u32 = 10;
 /// Silent frames handed on per sink call when a buffer is flagged silent.
 const ZERO_FRAMES: usize = 1024;
 
