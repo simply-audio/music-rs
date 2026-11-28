@@ -19,7 +19,8 @@ pub enum App {
     /// helpers, whose ids extend it (`com.google.Chrome.helper`).
     Bundle(String),
     /// An executable's file name, `djay Pro` (case-insensitive; a trailing
-    /// `.app` is ignored, so `djay Pro.app` works too).
+    /// `.app` or `.exe` is ignored, so `djay Pro.app` and, on Windows,
+    /// `Spotify` for `Spotify.exe` work too).
     Executable(String),
     /// One process. It does not follow a restart: a new process has a new
     /// pid.
@@ -38,7 +39,8 @@ pub enum App {
 
 impl App {
     /// A bundle id when `s` looks like one (reverse-DNS: a dot, no spaces
-    /// or slashes), a pid when it's all digits, else an executable name.
+    /// or slashes, not ending in `.app` or `.exe`), a pid when it's all
+    /// digits, else an executable name.
     pub fn parse(s: &str) -> App {
         let s = s.trim();
         if !s.is_empty()
@@ -49,7 +51,7 @@ impl App {
         }
         let reverse_dns = s.contains('.')
             && !s.contains([' ', '/'])
-            && !s.to_ascii_lowercase().ends_with(".app")
+            && stem(s).len() == s.len()
             && s.split('.').all(|p| !p.is_empty());
         if reverse_dns { App::Bundle(s.to_owned()) } else { App::Executable(s.to_owned()) }
     }
@@ -64,8 +66,7 @@ impl App {
                         && pb[..b.len()].eq_ignore_ascii_case(b))
             }),
             App::Executable(n) => {
-                let n = n.strip_suffix(".app").unwrap_or(n);
-                p.exe.as_deref().map(file_name).is_some_and(|f| f.eq_ignore_ascii_case(n))
+                p.exe.as_deref().is_some_and(|e| stem(file_name(e)).eq_ignore_ascii_case(stem(n)))
             }
             App::Pid(pid) => p.pid == *pid,
             App::This => p.pid == this,
@@ -611,8 +612,50 @@ fn join(items: impl Iterator<Item = String>) -> String {
     items.collect::<Vec<_>>().join(", ")
 }
 
+/// The last part of a path, macOS's or Windows'.
 pub(crate) fn file_name(path: &str) -> &str {
-    path.rsplit('/').next().unwrap_or(path)
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
+/// An executable's name without a trailing `.app` or `.exe` (any case).
+fn stem(name: &str) -> &str {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".app") || lower.ends_with(".exe") { &name[..name.len() - 4] } else { name }
+}
+
+/// The pids of `pids` that no other one of them is an ancestor of
+/// (`parent` gives a process's parent): a tap of a process tree takes in
+/// its children, so a child under another tapped process is not tapped
+/// again.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(crate) fn tree_roots(pids: &[u32], parent: impl Fn(u32) -> Option<u32>) -> Vec<u32> {
+    let mut roots: Vec<u32> = pids
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            let mut at = pid;
+            // Bounded: pids are reused, so a parent chain can loop.
+            for _ in 0..64 {
+                match parent(at) {
+                    Some(up) if up != at && up != pid => {
+                        if pids.contains(&up) {
+                            return false;
+                        }
+                        at = up;
+                    }
+                    _ => break,
+                }
+            }
+            true
+        })
+        .collect();
+    // Parents that loop (reused pids) leave none: keep one, not nothing.
+    if roots.is_empty() {
+        roots.extend(pids.iter().min());
+    }
+    roots.sort_unstable();
+    roots.dedup();
+    roots
 }
 
 /// Every listed process as the picker shows it: playing first, then by name.
@@ -698,6 +741,39 @@ pub(crate) mod tests {
         assert_eq!(App::parse("afplay"), App::Executable("afplay".into()));
         assert_eq!(App::parse(" 412 "), App::Pid(412));
         assert_eq!(App::parse("simply-tussen"), App::Executable("simply-tussen".into()));
+        assert_eq!(App::parse("Spotify.exe"), App::Executable("Spotify.exe".into()));
+    }
+
+    /// Windows has no bundle ids: an app is its executable, `.exe` or not.
+    #[test]
+    fn windows_executables_match_with_or_without_exe() {
+        let spotify = proc(7, 7, "", r"C:\Users\me\AppData\Roaming\Spotify\Spotify.exe");
+        assert!(App::Executable("spotify".into()).matches(&spotify, ME));
+        assert!(App::Executable("Spotify.exe".into()).matches(&spotify, ME));
+        assert!(App::parse("SPOTIFY.EXE").matches(&spotify, ME));
+        assert!(!App::Executable("spot".into()).matches(&spotify, ME));
+        let info = AppInfo::of(&spotify, ME);
+        assert_eq!(info.name, "Spotify.exe");
+        assert!(info.app().matches(&spotify, ME));
+    }
+
+    #[test]
+    fn a_child_under_another_tapped_process_is_not_tapped_again() {
+        // 1 → 10 → 11 (a browser and its audio helper), 20 alone, 30 → 31.
+        let parent = |pid| match pid {
+            10 => Some(1),
+            11 => Some(10),
+            31 => Some(30),
+            // A reused pid whose recorded parent loops back.
+            40 => Some(41),
+            41 => Some(40),
+            _ => None,
+        };
+        assert_eq!(tree_roots(&[11, 10, 20], parent), vec![10, 20]);
+        assert_eq!(tree_roots(&[11, 1], parent), vec![1]);
+        assert_eq!(tree_roots(&[31], parent), vec![31]);
+        assert_eq!(tree_roots(&[40, 41], parent), vec![40]);
+        assert_eq!(tree_roots(&[40], parent), vec![40]);
     }
 
     #[test]

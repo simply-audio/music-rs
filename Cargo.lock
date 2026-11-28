@@ -1726,6 +1726,8 @@ dependencies = [
  "objc2-core-audio-types",
  "objc2-core-foundation",
  "objc2-foundation",
+ "windows",
+ "windows-core",
 ]
 
 [[package]]

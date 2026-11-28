@@ -105,8 +105,9 @@
 //! This crate knows nothing of the program that uses it, so it can be copied
 //! between programs verbatim.
 
-// Only the macOS taps drive these; their types are the API everywhere, and
-// their tests (against fakes) run everywhere.
+// Only the macOS and Windows taps drive these (Windows not all of them);
+// their types are the API everywhere, and their tests (against fakes) run
+// everywhere.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod apps;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -115,11 +116,22 @@ mod buffers;
 mod channels;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod default_out;
+#[cfg_attr(not(windows), allow(dead_code))]
+mod mix;
 mod resample;
 #[cfg(target_os = "macos")]
 mod tap;
+#[cfg(windows)]
+mod wasapi;
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod watch;
+
+/// The OS's taps, one API: CoreAudio process taps on macOS, WASAPI
+/// loopback on Windows.
+#[cfg(target_os = "macos")]
+use tap as os;
+#[cfg(windows)]
+use wasapi as os;
 
 use resample::Resampler;
 
@@ -226,15 +238,19 @@ pub enum Permission {
 }
 
 /// Read (never request or change) whether this process may tap outputs.
+/// Always granted on Windows, where loopback asks no one's consent.
 pub fn permission() -> Permission {
     #[cfg(target_os = "macos")]
     return tap::permission();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    return Permission::Granted;
+    #[cfg(not(any(target_os = "macos", windows)))]
     return Permission::Unknown;
 }
 
-/// Every audio device, merged by name (see [`Device`]). Off macOS, cpal's
-/// inputs only.
+/// Every audio device, merged by name (see [`Device`]). On Windows, the
+/// render endpoints (tappable outputs) and cpal's inputs; elsewhere off
+/// macOS, cpal's inputs only.
 pub fn list_devices() -> Vec<Device> {
     let mut found: Vec<Device> = Vec::new();
     #[cfg(target_os = "macos")]
@@ -253,10 +269,20 @@ pub fn list_devices() -> Vec<Device> {
             }),
         }
     }
+    #[cfg(windows)]
+    found.extend(wasapi::list_devices());
     #[cfg(not(target_os = "macos"))]
     for d in cpal::default_host().input_devices().into_iter().flatten() {
         if let Some(name) = device_name(&d) {
-            found.push(Device { name, inputs: true, outputs: false, is_default_output: false });
+            match found.iter_mut().find(|f| f.name == name) {
+                Some(f) => f.inputs = true,
+                None => found.push(Device {
+                    name,
+                    inputs: true,
+                    outputs: false,
+                    is_default_output: false,
+                }),
+            }
         }
     }
     found
@@ -295,11 +321,11 @@ enum Running {
     /// The cpal stream lives on its own thread (a stream is not `Send` on
     /// every host); closing the channel ends it.
     Input { stop: Option<mpsc::Sender<()>>, thread: Option<JoinHandle<()>>, device_rate: u32 },
-    #[cfg(target_os = "macos")]
-    Tap(tap::OutputTap),
+    #[cfg(any(target_os = "macos", windows))]
+    Tap(os::OutputTap),
     /// A tap of the default output, moved to each new default.
-    #[cfg(target_os = "macos")]
-    Default(tap::DefaultTap),
+    #[cfg(any(target_os = "macos", windows))]
+    Default(os::DefaultTap),
 }
 
 impl Capture {
@@ -313,7 +339,7 @@ impl Capture {
     /// except for a tap of the default output, which moves with the default.
     pub fn device(&self) -> String {
         match &self.running {
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Running::Default(t) => t.now().device,
             _ => self.source.device().to_owned(),
         }
@@ -324,9 +350,9 @@ impl Capture {
     pub fn device_rate(&self) -> u32 {
         match &self.running {
             Running::Input { device_rate, .. } => *device_rate,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Running::Tap(t) => t.sample_rate,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", windows))]
             Running::Default(t) => t.now().device_rate,
         }
     }
@@ -338,13 +364,13 @@ impl Capture {
     /// new default's tap could not be made, and is retried; the tap's
     /// health), and clears when the tap recovers.
     pub fn error(&self) -> Option<String> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let Running::Default(t) = &self.running {
             return t.now().error;
         }
-        #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+        #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
         let mut slot = self.error.lock().unwrap_or_else(|e| e.into_inner());
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if let (None, Running::Tap(t)) = (&*slot, &self.running) {
             *slot = t.health();
         }
@@ -353,8 +379,8 @@ impl Capture {
 }
 
 impl Drop for Capture {
-    // Off macOS a device's inputs are the only way to run.
-    #[cfg_attr(not(target_os = "macos"), allow(irrefutable_let_patterns))]
+    // Off macOS and Windows a device's inputs are the only way to run.
+    #[cfg_attr(not(any(target_os = "macos", windows)), allow(irrefutable_let_patterns))]
     fn drop(&mut self) {
         if let Running::Input { stop, thread, .. } = &mut self.running {
             drop(stop.take());
@@ -433,10 +459,24 @@ where
             let t = tap::OutputTap::start(name, mute, rate, channels as usize, Box::new(sink))?;
             Ok(Capture { source: Source::Tap(t.device.clone()), error, running: Running::Tap(t) })
         }
-        #[cfg(not(target_os = "macos"))]
+        // No consent to check: loopback needs none on Windows.
+        #[cfg(windows)]
+        Source::Tap(name) => {
+            if name.is_empty() {
+                let t = wasapi::DefaultTap::start(rate, channels as usize, Box::new(sink))?;
+                return Ok(Capture {
+                    source: Source::Tap(t.now().device),
+                    error,
+                    running: Running::Default(t),
+                });
+            }
+            let t = wasapi::OutputTap::start(name, rate, channels as usize, Box::new(sink))?;
+            Ok(Capture { source: Source::Tap(t.device.clone()), error, running: Running::Tap(t) })
+        }
+        #[cfg(not(any(target_os = "macos", windows)))]
         Source::Tap(_) => Err(Error::new(
             ErrorKind::Unsupported,
-            "tapping an output needs macOS 14.2+; capture an input (a loopback device) instead",
+            "tapping an output needs macOS 14.2+ or Windows; capture an input (a loopback device) instead",
         )),
     }
 }
@@ -445,11 +485,12 @@ type Sink = Box<dyn FnMut(&[f32], u64) + Send>;
 
 /// Every process the HAL knows plays (or can play) audio, playing ones
 /// first: what an app picker shows. [`AppInfo::app`] is what to tap it by.
-/// Needs no permission. Empty off macOS.
+/// Needs no permission. On Windows, every process with an audio session.
+/// Empty off macOS and Windows.
 pub fn list_apps() -> Vec<AppInfo> {
-    #[cfg(target_os = "macos")]
-    return tap::list_apps();
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(any(target_os = "macos", windows))]
+    return os::list_apps();
+    #[cfg(not(any(target_os = "macos", windows)))]
     return Vec::new();
 }
 
@@ -458,8 +499,8 @@ pub fn list_apps() -> Vec<AppInfo> {
 /// aggregate device are destroyed.
 pub struct AppCapture {
     tap: AppTap,
-    #[cfg(target_os = "macos")]
-    following: tap::Following,
+    #[cfg(any(target_os = "macos", windows))]
+    following: os::Following,
 }
 
 impl AppCapture {
@@ -471,10 +512,10 @@ impl AppCapture {
     /// Tapping, waiting for the app, or failed (and retrying). Cheap: read
     /// it as often as a UI repaints.
     pub fn status(&self) -> AppStatus {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         return self.following.status();
-        #[cfg(not(target_os = "macos"))]
-        unreachable!("an AppCapture is only made on macOS")
+        #[cfg(not(any(target_os = "macos", windows)))]
+        unreachable!("an AppCapture is only made on macOS and Windows")
     }
 
     /// The last time its running tap went bad and was made again (it
@@ -483,10 +524,10 @@ impl AppCapture {
     /// status goes from tapping to tapping meanwhile: this is what says it
     /// reconnected. None until it has.
     pub fn remade(&self) -> Option<Remade> {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         return self.following.remade();
-        #[cfg(not(target_os = "macos"))]
-        unreachable!("an AppCapture is only made on macOS")
+        #[cfg(not(any(target_os = "macos", windows)))]
+        unreachable!("an AppCapture is only made on macOS and Windows")
     }
 
     /// The problem right now, if there is one: the tapped app exited (and
@@ -508,16 +549,17 @@ impl AppCapture {
 ///
 /// Returns once it has looked: tapping, or waiting for an app that isn't
 /// running. Fails when System Audio Recording is known to be denied, when
-/// [`Apps::Only`] names nothing, off macOS, or when the first tap could
-/// not be made.
+/// [`Apps::Only`] names nothing, off macOS and Windows, or when the first
+/// tap could not be made. On Windows also for what Windows can't do: a
+/// muted tap, and [`Apps::AllExcept`].
 pub fn start_app<F>(tap: &AppTap, rate: u32, channels: u16, sink: F) -> Result<AppCapture, Error>
 where
     F: FnMut(&[f32], u64) + Send + 'static,
 {
     may_tap_apps(tap)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
-        let following = tap::Following::start(
+        let following = os::Following::start(
             tap.clone(),
             rate.max(1),
             channels.max(1) as usize,
@@ -525,10 +567,10 @@ where
         )?;
         Ok(AppCapture { tap: tap.clone(), following })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (rate, channels, sink);
-        unreachable!("may_tap_apps refuses off macOS")
+        unreachable!("may_tap_apps refuses off macOS and Windows")
     }
 }
 
@@ -539,7 +581,8 @@ where
 /// at the default output's, and is resampled once, not twice. A tap
 /// already running on another clock is made again on this one at its
 /// next look (within half a second). A device that isn't there falls back
-/// to the default output. Off macOS: nothing.
+/// to the default output. Off macOS: nothing (on Windows a process tap has
+/// no clock device: the audio engine paces it).
 pub fn set_app_tap_clock(device: Option<&str>) {
     #[cfg(target_os = "macos")]
     tap::set_app_clock(device.map(str::to_owned));
@@ -562,7 +605,8 @@ pub fn set_app_tap_clock(device: Option<&str>) {
 /// doesn't take is held to the nearest it does; a refusal leaves it as it
 /// was. macOS keeps a buffer size per process and device, and the
 /// aggregates are private to this process, so no other program is touched.
-/// Off macOS: nothing.
+/// Off macOS: nothing (Windows taps deliver once per audio engine period,
+/// 10 ms).
 pub fn set_tap_buffer_frames(frames: Option<u32>) {
     #[cfg(target_os = "macos")]
     tap::set_buffer_frames(frames);
@@ -571,10 +615,21 @@ pub fn set_tap_buffer_frames(frames: Option<u32>) {
 }
 
 /// Why `tap` can't be followed here, if it can't: it names no app,
-/// System Audio Recording is known to be denied, or this isn't macOS.
+/// System Audio Recording is known to be denied, it asks Windows for what
+/// Windows can't do, or this is neither macOS nor Windows.
 fn may_tap_apps(tap: &AppTap) -> Result<(), Error> {
     if matches!(&tap.apps, Apps::Only(a) if a.is_empty()) {
         return Err(Error::new(ErrorKind::NotFound, "an app tap needs at least one app"));
+    }
+    #[cfg(windows)]
+    {
+        if tap.mute != Mute::Unmuted {
+            return Err(Error::new(ErrorKind::Unsupported, wasapi::NO_MUTE));
+        }
+        if matches!(tap.apps, Apps::AllExcept(_)) {
+            return Err(Error::new(ErrorKind::Unsupported, wasapi::NO_ALL_EXCEPT));
+        }
+        Ok(())
     }
     #[cfg(target_os = "macos")]
     if tap::permission() == Permission::Denied {
@@ -585,8 +640,8 @@ fn may_tap_apps(tap: &AppTap) -> Result<(), Error> {
             ),
         ));
     }
-    #[cfg(not(target_os = "macos"))]
-    return Err(Error::new(ErrorKind::Unsupported, "tapping an app needs macOS 14.2+"));
+    #[cfg(not(any(target_os = "macos", windows)))]
+    return Err(Error::new(ErrorKind::Unsupported, "tapping an app needs macOS 14.2+ or Windows"));
     #[cfg(target_os = "macos")]
     Ok(())
 }
@@ -596,8 +651,8 @@ fn may_tap_apps(tap: &AppTap) -> Result<(), Error> {
 /// [`AppSinks::stopped`] called, before the drop returns.
 pub struct AppChannels {
     tap: AppTap,
-    #[cfg(target_os = "macos")]
-    channels: tap::Channels,
+    #[cfg(any(target_os = "macos", windows))]
+    channels: os::Channels,
 }
 
 impl AppChannels {
@@ -609,10 +664,10 @@ impl AppChannels {
     /// The channels now, and the apps asked for that aren't running.
     /// Cheap: read it as often as a UI repaints.
     pub fn status(&self) -> ChannelsStatus {
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         return self.channels.status();
-        #[cfg(not(target_os = "macos"))]
-        unreachable!("an AppChannels is only made on macOS")
+        #[cfg(not(any(target_os = "macos", windows)))]
+        unreachable!("an AppChannels is only made on macOS and Windows")
     }
 }
 
@@ -671,16 +726,16 @@ pub fn start_app_channels<S: AppSinks>(
     sinks: S,
 ) -> Result<AppChannels, Error> {
     may_tap_apps(tap)?;
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     {
         let channels =
-            tap::Channels::start(tap.clone(), rate.max(1), channels.max(1) as usize, sinks)?;
+            os::Channels::start(tap.clone(), rate.max(1), channels.max(1) as usize, sinks)?;
         Ok(AppChannels { tap: tap.clone(), channels })
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = (rate, channels, sinks);
-        unreachable!("may_tap_apps refuses off macOS")
+        unreachable!("may_tap_apps refuses off macOS and Windows")
     }
 }
 
