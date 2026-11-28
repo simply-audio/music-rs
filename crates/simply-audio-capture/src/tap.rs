@@ -5,7 +5,7 @@
 //! follows). No BlackHole, no Multi-Output Device.
 //!
 //! A tap mixed down to stereo (by default **not muted**: the room keeps
-//! hearing it), wrapped in a **private** aggregate device that this process
+//! hearing it; a tap of a device never hears this process itself), wrapped in a **private** aggregate device that this process
 //! reads like an input. Both are created by [`OutputTap::open`] and
 //! destroyed when the [`OutputTap`] drops, and by coreaudiod when the
 //! process dies: a private tap and aggregate belong to the process that
@@ -179,12 +179,27 @@ struct Ctx {
 
 /// What a tap takes in.
 pub(crate) enum Kind {
-    /// Every process playing on this output device.
-    Device(Device),
+    /// Every process playing on this output device except the `exclude`d
+    /// process objects (this process: [`Kind::device`]).
+    Device { device: Device, mute: Mute, exclude: Vec<AudioObjectID> },
     /// The processes the [`Target`]s name (wherever they play, or on one
     /// device), mixed, clocked by `clock` (the app taps' clock device, else
     /// the default output, when the tap was made).
     Processes { targets: Vec<Target>, mute: Mute, clock: Device },
+}
+
+impl Kind {
+    /// A tap of every process playing on `device` except this one, so a
+    /// program never records its own playback.
+    pub(crate) fn device(device: Device, mute: Mute) -> Kind {
+        Kind::Device { device, mute, exclude: this_process().into_iter().collect() }
+    }
+}
+
+/// This process's HAL process object. It exists once the process has made
+/// any HAL call (finding the device to tap is one), playing or not.
+fn this_process() -> Option<AudioObjectID> {
+    translate_pid(std::process::id() as i32)
 }
 
 /// A running tap. Dropping it stops the IOProc and destroys the private
@@ -273,15 +288,17 @@ unsafe extern "C" {
 }
 
 impl OutputTap {
-    /// Tap every process on `device` (`""` = the default output) and start
-    /// handing interleaved `channels`-wide frames at `rate` to `sink`.
+    /// Tap every process on `device` (`""` = the default output) but this
+    /// one, muted as `mute` says, and start handing interleaved
+    /// `channels`-wide frames at `rate` to `sink`.
     pub(crate) fn start(
         device: &str,
+        mute: Mute,
         rate: u32,
         channels: usize,
         sink: Sink,
     ) -> Result<OutputTap, Error> {
-        OutputTap::open(Kind::Device(find_output(device)?), rate, channels, sink)
+        OutputTap::open(Kind::device(find_output(device)?, mute), rate, channels, sink)
             .map_err(|(e, _)| e)
     }
 
@@ -294,7 +311,7 @@ impl OutputTap {
         sink: Sink,
     ) -> Result<OutputTap, (Error, Sink)> {
         let clock = match &kind {
-            Kind::Device(d) | Kind::Processes { clock: d, .. } => d.clone(),
+            Kind::Device { device: d, .. } | Kind::Processes { clock: d, .. } => d.clone(),
         };
         let mut t = OutputTap {
             taps: Vec::new(),
@@ -469,20 +486,19 @@ unsafe fn descriptions(kind: &Kind) -> Result<Vec<Described>, Error> {
         // (desc, mixdown, the device it hears)
         let mut descs: Vec<(Retained<CATapDescription>, bool, Option<String>)> = Vec::new();
         let mute = match kind {
-            Kind::Device(d) => {
+            Kind::Device { device: d, mute, exclude } => {
                 let uid = NSString::from_str(&d.uid);
-                let none = NSArray::<NSNumber>::new();
                 descs.push((
                     CATapDescription::initExcludingProcesses_andDeviceUID_withStream(
                         alloc(),
-                        &none,
+                        &ids(exclude),
                         &uid,
                         0,
                     ),
                     true,
                     Some(d.uid.clone()),
                 ));
-                Mute::Unmuted
+                *mute
             }
             Kind::Processes { targets, mute, .. } => {
                 for target in targets {
@@ -1141,6 +1157,7 @@ impl Channels {
 
 /// The real [`Outputs`]: device taps on whatever the default output is.
 struct Defaults {
+    mute: Mute,
     rate: u32,
     channels: usize,
 }
@@ -1168,7 +1185,7 @@ impl Outputs for Defaults {
             }
             Err(e) => return Err((e, sink)),
         };
-        let tap = OutputTap::open(Kind::Device(device), self.rate, self.channels, sink)?;
+        let tap = OutputTap::open(Kind::device(device, self.mute), self.rate, self.channels, sink)?;
         let (name, rate) = (tap.device.clone(), tap.sample_rate);
         Ok((tap, name, rate))
     }
@@ -1194,11 +1211,17 @@ pub(crate) struct DefaultTap {
 }
 
 impl DefaultTap {
-    /// Tap the default output into `sink`. Returns once audio is flowing,
-    /// or with why not.
-    pub(crate) fn start(rate: u32, channels: usize, sink: Sink) -> Result<DefaultTap, Error> {
+    /// Tap the default output (every process on it but this one, muted as
+    /// `mute` says) into `sink`. Returns once audio is flowing, or with why
+    /// not.
+    pub(crate) fn start(
+        mute: Mute,
+        rate: u32,
+        channels: usize,
+        sink: Sink,
+    ) -> Result<DefaultTap, Error> {
         let now = Arc::new(Mutex::new(Now::default()));
-        let mut follow = FollowDefault::new(Defaults { rate, channels }, sink);
+        let mut follow = FollowDefault::new(Defaults { mute, rate, channels }, sink);
         let shared = Arc::clone(&now);
         let wake = Arc::new(Wake::new(TICK));
         let watcher =
@@ -1355,6 +1378,56 @@ mod tests {
         assert_eq!(app_clock(), (Some("Scarlett".into()), at + 1));
         set_app_clock(None);
         assert_eq!(app_clock(), (None, at + 2));
+    }
+
+    fn fake_device(uid: &str) -> Device {
+        Device {
+            id: 77,
+            name: "Speakers".into(),
+            uid: uid.into(),
+            inputs: false,
+            outputs: true,
+            is_default_output: true,
+        }
+    }
+
+    /// A device tap is one stereo mixdown of the device's first stream,
+    /// of every process but the excluded ones, muted as asked. Describing
+    /// it creates nothing, so this runs anywhere, without permission.
+    #[test]
+    fn a_device_tap_leaves_out_the_excluded_processes_and_mutes_as_asked() {
+        for (mute, behaviour) in [
+            (Mute::Unmuted, CATapMuteBehavior::Unmuted),
+            (Mute::Muted, CATapMuteBehavior::Muted),
+            (Mute::MutedWhenTapped, CATapMuteBehavior::MutedWhenTapped),
+        ] {
+            let kind = Kind::Device { device: fake_device("Spk_UID"), mute, exclude: vec![4242] };
+            let descs = unsafe { descriptions(&kind) }.unwrap();
+            assert_eq!(descs.len(), 1);
+            let (desc, source) = &descs[0];
+            assert_eq!(source.as_deref(), Some("Spk_UID"));
+            unsafe {
+                let procs: Vec<u32> = desc.processes().iter().map(|n| n.as_u32()).collect();
+                assert_eq!(procs, [4242]);
+                assert!(desc.isExclusive(), "the processes listed are left out");
+                assert_eq!(desc.isMuted(), behaviour);
+                assert_eq!(desc.deviceUID().map(|u| u.to_string()).as_deref(), Some("Spk_UID"));
+                assert!(desc.isMixdown() && !desc.isMono() && desc.isPrivate());
+            }
+        }
+    }
+
+    /// Every tap of a device leaves this process out: its process object
+    /// exists once it has asked the HAL anything (here, for the devices),
+    /// and a device tap's description excludes it. No permission needed.
+    #[test]
+    fn a_device_tap_leaves_this_process_out() {
+        list_devices().unwrap();
+        let me = this_process().expect("a process that asked the HAL anything is its client");
+        let Kind::Device { exclude, mute, .. } = Kind::device(fake_device("X"), Mute::Muted) else {
+            unreachable!()
+        };
+        assert_eq!((exclude, mute), (vec![me], Mute::Muted));
     }
 
     /// Enumeration needs no permission and finds the default output.
@@ -1644,27 +1717,6 @@ mod tests {
             "default output {:?}, other device {:?} ({})",
             default.name, other.name, other.uid
         );
-        type Heard = Arc<Mutex<Vec<f32>>>;
-        let into = |heard: &Heard| -> Sink {
-            let heard = Arc::clone(heard);
-            Box::new(move |f: &[f32], _| {
-                heard.lock().unwrap().extend(f.chunks(2).map(|c| c[0]));
-            })
-        };
-        // Amplitude of `hz` in the last second heard (Goertzel).
-        let level = |heard: &Heard, hz: f64| -> f64 {
-            let h = heard.lock().unwrap();
-            let x = &h[h.len().saturating_sub(48_000)..];
-            let k = 2.0 * (std::f64::consts::TAU * hz / 48_000.0).cos();
-            let (mut s1, mut s2) = (0.0, 0.0);
-            for &v in x {
-                let s0 = v as f64 + k * s1 - s2;
-                s2 = s1;
-                s1 = s0;
-            }
-            let power = s1 * s1 + s2 * s2 - k * s1 * s2;
-            2.0 * power.max(0.0).sqrt() / x.len().max(1) as f64
-        };
         let (quiet, loud) = (f64::from(TONES.0.1), f64::from(TONES.1.1));
 
         // 1. The API itself.
@@ -1724,6 +1776,92 @@ mod tests {
         assert!(got.0 > quiet / 2.0 && got.1 < loud / 100.0, "{got:?}");
         drop(f);
         drop(child);
+        assert!(ours().is_empty());
+    }
+
+    /// The left channel of what a 48 kHz stereo tap heard.
+    type Heard = Arc<Mutex<Vec<f32>>>;
+
+    fn into(heard: &Heard) -> Sink {
+        let heard = Arc::clone(heard);
+        Box::new(move |f: &[f32], _| {
+            heard.lock().unwrap().extend(f.chunks(2).map(|c| c[0]));
+        })
+    }
+
+    /// Amplitude of `hz` in the last second heard (Goertzel).
+    fn level(heard: &Heard, hz: f64) -> f64 {
+        let h = heard.lock().unwrap();
+        let x = &h[h.len().saturating_sub(48_000)..];
+        let k = 2.0 * (std::f64::consts::TAU * hz / 48_000.0).cos();
+        let (mut s1, mut s2) = (0.0, 0.0);
+        for &v in x {
+            let s0 = v as f64 + k * s1 - s2;
+            s2 = s1;
+            s1 = s0;
+        }
+        let power = s1 * s1 + s2 * s2 - k * s1 * s2;
+        2.0 * power.max(0.0).sqrt() / x.len().max(1) as f64
+    }
+
+    /// This process plays a quiet 997 Hz tone on the default output: a tap
+    /// of the default output doesn't hear it (it leaves this process out),
+    /// a tap of this process does (it is playing). Other apps playing on
+    /// the Mac add to the first, but not at 997 Hz. Skips itself while
+    /// System Audio Recording was never asked for, so it never raises the
+    /// prompt: `cargo test -p simply-audio-capture --lib
+    /// tap::tests::a_device_tap_does_not_hear -- --ignored --nocapture`.
+    #[test]
+    #[ignore = "plays a quiet tone on the default output and taps it"]
+    fn a_device_tap_does_not_hear_this_process() {
+        use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+        let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
+        if permission() != Permission::Granted {
+            eprintln!("skipped: System Audio Recording is {:?}", permission());
+            return;
+        }
+        let (hz, amp) = (997.0f32, 1e-3f32);
+        let out = cpal::default_host().default_output_device().unwrap();
+        let config = out.default_output_config().unwrap().config();
+        let (rate, ch) = (config.sample_rate as f32, config.channels as usize);
+        let mut phase = 0f32;
+        let player = out
+            .build_output_stream::<f32, _, _>(
+                config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    for frame in data.chunks_mut(ch) {
+                        frame.fill(amp * (phase * std::f32::consts::TAU).sin());
+                        phase = (phase + hz / rate).fract();
+                    }
+                },
+                |_| {},
+                None,
+            )
+            .unwrap();
+        player.play().unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let heard = |kind: Kind| {
+            let h = Heard::default();
+            let tap = OutputTap::open(kind, 48_000, 2, into(&h)).map_err(|(e, _)| e).unwrap();
+            std::thread::sleep(Duration::from_millis(1500));
+            drop(tap);
+            level(&h, hz as f64)
+        };
+        let default = find_output("").unwrap();
+        let me = this_process().unwrap();
+        let device = heard(Kind::device(default.clone(), Mute::Unmuted));
+        let mine = heard(Kind::Processes {
+            targets: vec![Target::Processes(vec![me])],
+            mute: Mute::Unmuted,
+            clock: default.clone(),
+        });
+        drop(player);
+        eprintln!(
+            "{hz} Hz on {:?}: device tap {device:.2e}, this process {mine:.2e}",
+            default.name
+        );
+        assert!(mine > f64::from(amp) / 2.0, "this process's tone isn't playing: {mine:.2e}");
+        assert!(device < f64::from(amp) / 20.0, "the device tap hears this process: {device:.2e}");
         assert!(ours().is_empty());
     }
 
@@ -2043,7 +2181,8 @@ mod tests {
     fn a_tap_leaves_no_aggregate_device_behind() {
         let _serial = REAL_TAP.lock().unwrap_or_else(|e| e.into_inner());
         eprintln!("permission: {:?}", permission());
-        let tap = OutputTap::start("", 48_000, 2, Box::new(|_: &[f32], _: u64| {})).unwrap();
+        let tap = OutputTap::start("", Mute::Unmuted, 48_000, 2, Box::new(|_: &[f32], _: u64| {}))
+            .unwrap();
         eprintln!("tapping {:?} at {} Hz", tap.device, tap.sample_rate);
         assert_eq!(ours().len(), 1, "the private aggregate is visible to its own process");
         drop(tap);
@@ -2072,6 +2211,7 @@ mod tests {
         let seen = Arc::clone(&most);
         let tap = OutputTap::start(
             "",
+            Mute::Unmuted,
             rate.round() as u32,
             2,
             Box::new(move |f: &[f32], _: u64| {

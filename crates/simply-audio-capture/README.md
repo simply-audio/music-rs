@@ -5,7 +5,7 @@ Capture any audio device by name, inputs and outputs alike, through one call.
 The rule ([`resolve`]):
 
 * a device with **input channels** is captured as an input, through cpal;
-* an **output-only** device (speakers, headphones, a display, a Multi-Output Device) is captured by tapping what the Mac plays on it: a CoreAudio process tap of every process, mixed to stereo and **not muted**, inside a private aggregate device this process reads like an input (macOS 14.2+);
+* an **output-only** device (speakers, headphones, a display, a Multi-Output Device) is captured by tapping what the Mac plays on it: a CoreAudio process tap of every process **but this one** (a program never records its own playback), mixed to stereo and **not muted** unless [`start_with_mute`] asks for it, inside a private aggregate device this process reads like an input (macOS 14.2+);
 * `""` is the current default output, tapped, and **followed**: when the Mac's default output changes mid-tap the tap moves to the new device (a clean restart, the same sink) and the stream carries on.
 
 Either way the device runs at its own rate (nothing on the machine is retuned) and the frames are resampled to the rate asked for, if it differs, before they reach the sink.

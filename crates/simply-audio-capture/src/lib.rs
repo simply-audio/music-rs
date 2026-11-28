@@ -6,9 +6,10 @@
 //! * a device with **input channels** is captured as an input, through cpal;
 //! * an **output-only** device (speakers, headphones, a display, a
 //!   Multi-Output Device) is captured by tapping what the Mac plays on it: a
-//!   CoreAudio process tap of every process, mixed to stereo and **not
-//!   muted**, inside a private aggregate device this process reads like an
-//!   input (macOS 14.2+);
+//!   CoreAudio process tap of every process **but this one** (a program
+//!   never records its own playback), mixed to stereo and **not muted**
+//!   unless [`start_with_mute`] asks for it, inside a private aggregate
+//!   device this process reads like an input (macOS 14.2+);
 //! * `""` is the current default output, tapped, and **followed**: when the
 //!   Mac's default output changes mid-tap the tap moves to the new device
 //!   (a clean restart, the same sink) and the stream carries on.
@@ -368,10 +369,36 @@ impl Drop for Capture {
 
 /// Start capturing `source` as `channels`-wide frames at `rate` into `sink`
 /// (see the crate docs). Returns once audio is flowing, or with why not.
+/// A tap is not muted: [`start_with_mute`] with [`Mute::Unmuted`].
 pub fn start<F>(source: &Source, rate: u32, channels: u16, sink: F) -> Result<Capture, Error>
 where
     F: FnMut(&[f32], u64) + Send + 'static,
 {
+    start_with_mute(source, Mute::Unmuted, rate, channels, sink)
+}
+
+/// [`start`], with whether a tap mutes what it taps, as an app tap's
+/// [`AppTap::mute`] does: [`Mute::Muted`] silences every process the tap
+/// hears on that device while it is captured, so they reach this process
+/// and not the speakers. This process is never tapped, so it is never
+/// muted either: what it plays on the device is still heard. An input
+/// can't be muted, so it takes only [`Mute::Unmuted`].
+pub fn start_with_mute<F>(
+    source: &Source,
+    mute: Mute,
+    rate: u32,
+    channels: u16,
+    sink: F,
+) -> Result<Capture, Error>
+where
+    F: FnMut(&[f32], u64) + Send + 'static,
+{
+    if mute != Mute::Unmuted && matches!(source, Source::Input(_)) {
+        return Err(Error::new(
+            ErrorKind::Unsupported,
+            format!("{:?} is read as an input, which can't be muted", source.device()),
+        ));
+    }
     let channels = channels.max(1);
     let rate = rate.max(1);
     let error = Arc::new(Mutex::new(None));
@@ -396,14 +423,14 @@ where
                 ));
             }
             if name.is_empty() {
-                let t = tap::DefaultTap::start(rate, channels as usize, Box::new(sink))?;
+                let t = tap::DefaultTap::start(mute, rate, channels as usize, Box::new(sink))?;
                 return Ok(Capture {
                     source: Source::Tap(t.now().device),
                     error,
                     running: Running::Default(t),
                 });
             }
-            let t = tap::OutputTap::start(name, rate, channels as usize, Box::new(sink))?;
+            let t = tap::OutputTap::start(name, mute, rate, channels as usize, Box::new(sink))?;
             Ok(Capture { source: Source::Tap(t.device.clone()), error, running: Running::Tap(t) })
         }
         #[cfg(not(target_os = "macos"))]
@@ -826,6 +853,13 @@ mod tests {
         assert!(err.to_string().contains("MacBook Pro Speakers"), "{err}");
         devices[3].is_default_output = false;
         assert_eq!(resolve(&devices, "").unwrap_err().kind(), ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn an_input_can_t_be_muted() {
+        let input = Source::Input("Scarlett 4i4 USB".into());
+        let err = start_with_mute(&input, Mute::Muted, 48_000, 2, |_: &[f32], _| {}).err();
+        assert_eq!(err.map(|e| e.kind()), Some(ErrorKind::Unsupported));
     }
 
     /// Everything `feed` hands its sink, at `from` → `to`.
